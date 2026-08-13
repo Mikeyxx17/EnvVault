@@ -1,0 +1,1 @@
+%{"format":"envvault-vault-descriptor","version":2,"vault_id":"EREREREREREREREREREREQ==","generation":9,"audit":{"digest_algorithm":"sha256","sealed_segments":[],"active_segment":{"segment_id":7,"start_sequence":42,"next_sequence":43,"previous_segment_authenticator":"IiIiIiIiIiIiIiIiIiIiIg==","head_authenticator":"VVVVVVVVVVVVVVVVVVVVVQ=="}}}

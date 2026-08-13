@@ -1,0 +1,1 @@
+#{"format":"envvault-audit-anchor","version":2,"vault_id":"EREREREREREREREREREREQ==","anchor_generation":3,"segment_id":7,"sequence":42,"terminal_authenticator":"VVVVVVVVVVVVVVVVVVVVVQ==","digest_algorithm":"sha256","previous_anchor_digest":"ZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmY=","created_unix_time_millis":1700000000456}

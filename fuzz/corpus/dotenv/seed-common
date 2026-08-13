@@ -1,0 +1,2 @@
+DATABASE_URL=postgres://localhost/example
+API_TOKEN='literal-value'

@@ -1,0 +1,40 @@
+[package]
+name = "envvault-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+envvault = { path = "..", features = ["fuzzing"] }
+
+[[bin]]
+name = "vault"
+path = "fuzz_targets/vault.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "identity_audit"
+path = "fuzz_targets/identity_audit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_profile"
+path = "fuzz_targets/policy_profile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dotenv"
+path = "fuzz_targets/dotenv.rs"
+test = false
+doc = false
+bench = false
