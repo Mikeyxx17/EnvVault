@@ -41,4 +41,7 @@ jobs:
       - name: Clippy
         run: cargo +1.97.0 clippy --workspace --all-targets --all-features -- -D warnings
       - name: Tests
+        env:
+          # macOS /var is a symlink; EnvVault intentionally rejects linked ancestors.
+          TMPDIR: ${{ runner.temp }}
         run: cargo +1.97.0 test --workspace --all-features --locked
