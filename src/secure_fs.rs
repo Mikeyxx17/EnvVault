@@ -287,6 +287,9 @@ mod windows {
         },
     };
 
+    const SYSTEM_SID: &str = "S-1-5-18";
+    const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+
     pub(super) fn protect_file(file: &mut File) -> io::Result<()> {
         let existing = GetSecurityInfo(
             file,
@@ -324,7 +327,7 @@ mod windows {
         let dacl = descriptor
             .dacl()
             .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "file has no DACL"))?;
-        if dacl.len() != 3 {
+        if dacl.len() != expected_principal_count(&owner_sid) {
             return Err(insecure_dacl());
         }
 
@@ -339,12 +342,19 @@ mod windows {
             {
                 return Err(insecure_dacl());
             }
-            match ace.sid().map(ToString::to_string).as_deref() {
-                Some(sid) if sid == owner_sid => seen_owner = true,
-                Some("S-1-5-18") => seen_system = true,
-                Some("S-1-5-32-544") => seen_administrators = true,
-                _ => return Err(insecure_dacl()),
+            let sid = ace
+                .sid()
+                .map(ToString::to_string)
+                .ok_or_else(insecure_dacl)?;
+            let is_owner = sid == owner_sid;
+            let is_system = sid == SYSTEM_SID;
+            let is_administrators = sid == ADMINISTRATORS_SID;
+            if !(is_owner || is_system || is_administrators) {
+                return Err(insecure_dacl());
             }
+            seen_owner |= is_owner;
+            seen_system |= is_system;
+            seen_administrators |= is_administrators;
         }
         if !(seen_owner && seen_system && seen_administrators) {
             return Err(insecure_dacl());
@@ -361,7 +371,18 @@ mod windows {
     }
 
     fn private_sddl(owner_sid: &str) -> String {
-        format!("D:P(A;;FA;;;{owner_sid})(A;;FA;;;SY)(A;;FA;;;BA)")
+        let mut sddl = format!("D:P(A;;FA;;;{owner_sid})");
+        if owner_sid != SYSTEM_SID {
+            sddl.push_str("(A;;FA;;;SY)");
+        }
+        if owner_sid != ADMINISTRATORS_SID {
+            sddl.push_str("(A;;FA;;;BA)");
+        }
+        sddl
+    }
+
+    fn expected_principal_count(owner_sid: &str) -> u32 {
+        1 + u32::from(owner_sid != SYSTEM_SID) + u32::from(owner_sid != ADMINISTRATORS_SID)
     }
 
     fn insecure_dacl() -> io::Error {
@@ -369,6 +390,26 @@ mod windows {
             io::ErrorKind::PermissionDenied,
             "sensitive file DACL is not private",
         )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{ADMINISTRATORS_SID, SYSTEM_SID, expected_principal_count, private_sddl};
+
+        #[test]
+        fn private_dacl_deduplicates_well_known_owner_sids() {
+            assert_eq!(expected_principal_count("S-1-5-21-1"), 3);
+            assert_eq!(expected_principal_count(SYSTEM_SID), 2);
+            assert_eq!(expected_principal_count(ADMINISTRATORS_SID), 2);
+            assert_eq!(
+                private_sddl(ADMINISTRATORS_SID),
+                "D:P(A;;FA;;;S-1-5-32-544)(A;;FA;;;SY)"
+            );
+            assert_eq!(
+                private_sddl(SYSTEM_SID),
+                "D:P(A;;FA;;;S-1-5-18)(A;;FA;;;BA)"
+            );
+        }
     }
 }
 
