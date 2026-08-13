@@ -1,6 +1,8 @@
 /target/
 /fuzz/target/
 /fuzz/artifacts/
+/fuzz/coverage/
+/fuzz/runs/
 
 # Local Vaults, sidecars, and issued bearer credentials must never be committed.
 *.vault*

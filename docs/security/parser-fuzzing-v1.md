@@ -1,6 +1,6 @@
 # Parser Fuzzing and Security Properties V1
 
-状态：四个 libFuzzer target 已构建；2026-08-13 在 Windows x64 ASan 下完成两轮每 target 60 秒 campaign，四项均正常退出且未产生 crash artifact；第二轮包含 Identity Registry V3 credential-expiry seed。定时 CI 已配置为每个 target 运行五分钟，但远端尚未实际执行，因此仍不是长期 fuzz 验收。
+状态：四个 libFuzzer target 已构建；2026-08-13 在 Windows x64 ASan 下完成两轮每 target 60 秒 campaign，四项均正常退出且未产生 crash artifact；第二轮包含 Identity Registry V3 credential-expiry seed。定时 CI 已升级为参数化长跑（默认每 target 30 分钟）、corpus 最小化与行覆盖率报告，但远端长期 campaign 尚未实际跑满并形成覆盖率趋势，因此仍不是长期 fuzz 验收。
 
 ## Targets
 
@@ -16,7 +16,16 @@
 ```powershell
 cargo +nightly fuzz build
 .\scripts\fuzz-smoke.ps1 -SecondsPerTarget 15
+
+# 有界 campaign：长跑 + corpus 最小化 + 覆盖率 + 运行记录
+.\scripts\fuzz-campaign.ps1 -SecondsPerTarget 900
 ```
+
+`fuzz-campaign.ps1` 会对每个 target 执行 `cargo +nightly fuzz run`、就地 `cargo fuzz cmin`
+最小化持久 corpus，可选 `cargo fuzz coverage` + `llvm-cov` 生成 `envvault` crate 行覆盖率，
+并把 crash/timeout/OOM artifact、日志、覆盖率与 value-free 运行记录写入 `fuzz/runs/<timestamp>/`。
+记录字段与人工评审清单见 `fuzz/run-record-template.md`。定时 CI（`.github/workflows/fuzz.yml`）
+按 target 并行长跑、最小化并上传 corpus 与覆盖率 artifact，发现 crash 时使任务失败。
 
 主工程仍使用 stable。Windows runner 会把 Visual Studio 的 `clang_rt.asan_dynamic-x86_64.dll` 目录加入该进程 `PATH`。仅提交经过评审的 `seed-*` 初始语料；运行时生成的 corpus 和 crash artifact 不进入普通源码提交。
 
@@ -38,8 +47,7 @@ Phase 7P/7Q 新增紧凑 Identity Registry V2/V3 seed；V2 曾以 `-runs=1 -max_
 
 ## 尚未完成
 
-- 小时级/持续 CI fuzz campaign 与覆盖率趋势；
-- corpus 审核、最小化和跨平台复用；
-- 本机生成 corpus 保留为忽略的工作数据，提交前仍需最小化、去重和恶意内容审查；
+- 真实小时级/持续 CI fuzz campaign 的长期运行，以及跨多次运行的覆盖率趋势追踪；当前只有单次报告与自动化骨架；
+- corpus 的跨平台复用与人工审核；最小化已由 `fuzz-campaign.ps1`/CI 自动化，但提交前的去重、恶意内容审查和跨平台确认仍需人工；
 - OOM/超长输入、故障注入和差分 parser 测试；
 - 独立 parser、安全边界与供应链评审；自动依赖审计不能替代这些评审。
