@@ -868,38 +868,47 @@ mod tests {
                 rotated_issued,
                 rotated_issued + DEFAULT_CREDENTIAL_LIFETIME_MILLIS,
             )?;
-            assert!(!registry
-                .credential_is_active(id, CallerKind::Application, rotated_issued - 1));
+            assert!(!registry.credential_is_active(
+                id,
+                CallerKind::Application,
+                rotated_issued - 1
+            ));
             assert!(registry.credential_is_active(id, CallerKind::Application, rotated_issued));
             Ok(())
         }
 
         #[test]
-        fn credential_windows_must_be_exactly_ninety_days()
-        -> Result<(), Box<dyn std::error::Error>> {
+        fn credential_windows_must_be_exactly_ninety_days() -> Result<(), Box<dyn std::error::Error>>
+        {
             let mut registry = registry();
             let name = CallerName::new("strict")?;
-            let metadata = RegisteredCaller::new(
-                Caller::new(caller(0x45), CallerKind::AiAgent),
-                name,
+            let metadata =
+                RegisteredCaller::new(Caller::new(caller(0x45), CallerKind::AiAgent), name);
+            assert!(
+                registry
+                    .insert(
+                        metadata.clone(),
+                        verifier(0x45),
+                        100,
+                        100 + DEFAULT_CREDENTIAL_LIFETIME_MILLIS - 1,
+                    )
+                    .is_err()
             );
-            assert!(registry
-                .insert(
-                    metadata.clone(),
-                    verifier(0x45),
-                    100,
-                    100 + DEFAULT_CREDENTIAL_LIFETIME_MILLIS - 1,
-                )
-                .is_err());
-            assert!(registry
-                .insert(
-                    metadata.clone(),
-                    verifier(0x45),
-                    100,
-                    100 + DEFAULT_CREDENTIAL_LIFETIME_MILLIS + 1,
-                )
-                .is_err());
-            assert!(registry.insert(metadata, verifier(0x45), 0, u64::MAX).is_ok());
+            assert!(
+                registry
+                    .insert(
+                        metadata.clone(),
+                        verifier(0x45),
+                        100,
+                        100 + DEFAULT_CREDENTIAL_LIFETIME_MILLIS + 1,
+                    )
+                    .is_err()
+            );
+            assert!(
+                registry
+                    .insert(metadata, verifier(0x45), 0, u64::MAX)
+                    .is_ok()
+            );
             let id = caller(0x45);
             assert!(registry.credential_is_active(id, CallerKind::AiAgent, u64::MAX - 1));
             Ok(())
@@ -930,10 +939,7 @@ mod tests {
                 AuthenticationDisposition::Blocked
             );
             assert_eq!(
-                decoded.authentication_disposition(
-                    id,
-                    1_004 + AUTHENTICATION_BLOCK_MILLIS + 1,
-                ),
+                decoded.authentication_disposition(id, 1_004 + AUTHENTICATION_BLOCK_MILLIS + 1,),
                 AuthenticationDisposition::Proceed
             );
             Ok(())
@@ -958,10 +964,7 @@ mod tests {
                 AuthenticationDisposition::Blocked
             );
             assert_eq!(
-                registry.authentication_disposition(
-                    victim,
-                    200 + AUTHENTICATION_BLOCK_MILLIS + 1,
-                ),
+                registry.authentication_disposition(victim, 200 + AUTHENTICATION_BLOCK_MILLIS + 1,),
                 AuthenticationDisposition::Proceed
             );
         }
@@ -985,8 +988,8 @@ mod tests {
         }
 
         #[test]
-        fn tampered_throttle_state_is_rejected_on_decode()
-        -> Result<(), Box<dyn std::error::Error>> {
+        fn tampered_throttle_state_is_rejected_on_decode() -> Result<(), Box<dyn std::error::Error>>
+        {
             let mut registry = registry();
             for attempt in 0..AUTHENTICATION_GLOBAL_FAILURE_LIMIT {
                 let id = caller(u8::try_from(attempt).unwrap_or(u8::MAX));
@@ -1119,10 +1122,7 @@ mod tests {
                 AuthenticationDisposition::Proceed
             );
             assert_eq!(
-                process_c.authentication_disposition(
-                    x,
-                    1_004 + AUTHENTICATION_BLOCK_MILLIS + 1,
-                ),
+                process_c.authentication_disposition(x, 1_004 + AUTHENTICATION_BLOCK_MILLIS + 1,),
                 AuthenticationDisposition::Proceed
             );
             Ok(())

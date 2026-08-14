@@ -169,8 +169,8 @@ impl<Transport: AnchorTransport> AnchorSink for ProtocolAnchorClient<Transport> 
             .map_err(|_| VaultError::AuditAnchorDegraded)?;
         match response.status {
             200 => {
-                let body: AnchorBody =
-                    serde_json::from_slice(&response.body).map_err(|_| VaultError::InvalidFormat)?;
+                let body: AnchorBody = serde_json::from_slice(&response.body)
+                    .map_err(|_| VaultError::InvalidFormat)?;
                 let bytes = decode_anchor_field(&body.anchor)?;
                 let observed = parse_anchor(&bytes)?;
                 let canonical = serialize_anchor(&observed)?;
@@ -351,8 +351,7 @@ impl<Transport: AnchorTransport> ProtocolAnchorClient<Transport> {
 
     fn verify_no_rollback(&self, generation: u64, bytes: &[u8]) -> Result<(), VaultError> {
         if let Some((confirmed, confirmed_bytes)) = &self.last_confirmed
-            && (generation < *confirmed
-                || (generation == *confirmed && confirmed_bytes != bytes))
+            && (generation < *confirmed || (generation == *confirmed && confirmed_bytes != bytes))
         {
             return Err(VaultError::AuditAnchorDegraded);
         }
@@ -473,8 +472,7 @@ impl TestDoubleServer {
         };
         if canonical != anchor_bytes
             || proposed.vault_id() != path_vault
-            || proposed.anchor_generation()
-                != request.expected_generation.saturating_add(1)
+            || proposed.anchor_generation() != request.expected_generation.saturating_add(1)
         {
             return (422, error_body("invalid_anchor"));
         }
@@ -643,8 +641,8 @@ mod tests {
     use base64::Engine as _;
 
     use super::{
-        AnchorMethod, AnchorTransport, ProtocolAnchorClient, TestDoubleServer,
-        TransportFailure, TransportResponse,
+        AnchorMethod, AnchorTransport, ProtocolAnchorClient, TestDoubleServer, TransportFailure,
+        TransportResponse,
     };
     use crate::{
         crypto::sha256,
@@ -663,13 +661,7 @@ mod tests {
         previous: [u8; 32],
     ) -> Result<Vec<u8>, VaultError> {
         serialize_anchor(&AuditAnchorV2::new(
-            VAULT,
-            generation,
-            generation,
-            generation,
-            terminal,
-            previous,
-            0,
+            VAULT, generation, generation, generation, terminal, previous, 0,
         )?)
     }
 
@@ -758,10 +750,7 @@ mod tests {
         let first = &generations(1)?[0];
         assert_eq!(sink.compare_and_set(0, first)?, AnchorCasResult::Applied);
         let fork = anchor(1, [0x77; 16], [0_u8; 32])?;
-        assert_eq!(
-            sink.compare_and_set(0, &fork)?,
-            AnchorCasResult::Conflict
-        );
+        assert_eq!(sink.compare_and_set(0, &fork)?, AnchorCasResult::Conflict);
         Ok(())
     }
 
@@ -813,14 +802,8 @@ mod tests {
         };
         let mut sink = new_client(transport);
         let gens = generations(2)?;
-        assert_eq!(
-            sink.compare_and_set(0, &gens[0])?,
-            AnchorCasResult::Applied
-        );
-        assert_eq!(
-            sink.compare_and_set(1, &gens[1])?,
-            AnchorCasResult::Applied
-        );
+        assert_eq!(sink.compare_and_set(0, &gens[0])?, AnchorCasResult::Applied);
+        assert_eq!(sink.compare_and_set(1, &gens[1])?, AnchorCasResult::Applied);
         sink.transport
             .server
             .set_forced_state(Some((1, gens[0].clone())));
@@ -839,18 +822,10 @@ mod tests {
         };
         let mut sink = new_client(transport);
         let gens = generations(2)?;
-        assert_eq!(
-            sink.compare_and_set(0, &gens[0])?,
-            AnchorCasResult::Applied
-        );
-        assert_eq!(
-            sink.compare_and_set(1, &gens[1])?,
-            AnchorCasResult::Applied
-        );
+        assert_eq!(sink.compare_and_set(0, &gens[0])?, AnchorCasResult::Applied);
+        assert_eq!(sink.compare_and_set(1, &gens[1])?, AnchorCasResult::Applied);
         let fork = anchor(2, [0x66; 16], sha256(&gens[0]))?;
-        sink.transport
-            .server
-            .set_forced_state(Some((2, fork)));
+        sink.transport.server.set_forced_state(Some((2, fork)));
         let error = sink.load().err().ok_or("expected rollback failure")?;
         assert_eq!(error, VaultError::AuditAnchorDegraded);
         Ok(())
@@ -866,14 +841,8 @@ mod tests {
         };
         let mut sink = new_client(transport);
         let gens = generations(2)?;
-        assert_eq!(
-            sink.compare_and_set(0, &gens[0])?,
-            AnchorCasResult::Applied
-        );
-        assert_eq!(
-            sink.compare_and_set(1, &gens[1])?,
-            AnchorCasResult::Applied
-        );
+        assert_eq!(sink.compare_and_set(0, &gens[0])?, AnchorCasResult::Applied);
+        assert_eq!(sink.compare_and_set(1, &gens[1])?, AnchorCasResult::Applied);
         sink.transport
             .server
             .set_forced_state(Some((1, gens[0].clone())));
@@ -896,14 +865,8 @@ mod tests {
         };
         let mut sink = new_client(transport);
         let gens = generations(2)?;
-        assert_eq!(
-            sink.compare_and_set(0, &gens[0])?,
-            AnchorCasResult::Applied
-        );
-        assert_eq!(
-            sink.compare_and_set(1, &gens[1])?,
-            AnchorCasResult::Applied
-        );
+        assert_eq!(sink.compare_and_set(0, &gens[0])?, AnchorCasResult::Applied);
+        assert_eq!(sink.compare_and_set(1, &gens[1])?, AnchorCasResult::Applied);
         let revived_server = std::mem::take(&mut sink.transport.server);
         let mut revived = new_client(ScriptedTransport {
             server: revived_server,
@@ -960,8 +923,8 @@ mod tests {
     }
 
     #[test]
-    fn client_rejects_non_canonical_anchor_before_sending()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn client_rejects_non_canonical_anchor_before_sending() -> Result<(), Box<dyn std::error::Error>>
+    {
         let server = TestDoubleServer::default();
         let transport = ScriptedTransport {
             server,
@@ -979,8 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_anchor_in_a_200_response_fails_closed()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn corrupt_anchor_in_a_200_response_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
         let mut server = TestDoubleServer::default();
         server.set_corrupt_anchor_response(true);
         let transport = ScriptedTransport {
