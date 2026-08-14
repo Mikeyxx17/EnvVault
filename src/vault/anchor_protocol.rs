@@ -904,8 +904,7 @@ mod tests {
             sink.compare_and_set(1, &gens[1])?,
             AnchorCasResult::Applied
         );
-        let revived_server =
-            std::mem::replace(&mut sink.transport.server, TestDoubleServer::default());
+        let revived_server = std::mem::take(&mut sink.transport.server);
         let mut revived = new_client(ScriptedTransport {
             server: revived_server,
             script: VecDeque::new(),

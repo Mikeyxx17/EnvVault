@@ -818,7 +818,7 @@ mod tests {
             registry.insert(
                 RegisteredCaller::new(
                     Caller::new(caller(byte), CallerKind::Application),
-                    CallerName::new(&format!("caller-{byte}"))?,
+                    CallerName::new(format!("caller-{byte}"))?,
                 ),
                 verifier(byte),
                 issued,
@@ -940,8 +940,7 @@ mod tests {
         }
 
         #[test]
-        fn global_failure_limit_is_a_bounded_shared_fate_denial_of_service()
-        -> Result<(), Box<dyn std::error::Error>> {
+        fn global_failure_limit_is_a_bounded_shared_fate_denial_of_service() {
             let mut registry = registry();
             for attempt in 0..AUTHENTICATION_GLOBAL_FAILURE_LIMIT {
                 let id = caller(u8::try_from(attempt).unwrap_or(u8::MAX));
@@ -965,7 +964,6 @@ mod tests {
                 ),
                 AuthenticationDisposition::Proceed
             );
-            Ok(())
         }
 
         #[test]

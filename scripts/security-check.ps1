@@ -37,7 +37,8 @@ if ($Release) {
 }
 
 if ($IncludeWindowsCredentialStore) {
-    if (-not $IsWindows) {
+    $onWindows = ($IsWindows -eq $true) -or ($env:OS -eq 'Windows_NT')
+    if (-not $onWindows) {
         throw 'The real credential-store lifecycle gate is currently available only on Windows.'
     }
     Invoke-Checked 'Real Windows Credential Manager lifecycle' {
