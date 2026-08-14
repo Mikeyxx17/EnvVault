@@ -1,0 +1,84 @@
+{
+  "schema": "envvault-fuzz-run-v1",
+  "started_at_utc": "2026-08-13T17:32:17.2899080Z",
+  "finished_at_utc": "2026-08-13T21:33:05.8137984Z",
+  "duration_seconds": 14449,
+  "toolchain": "rustc 1.99.0-nightly (ad3d0bc14 2026-07-31)",
+  "cargo_fuzz": "cargo-fuzz 0.13.2",
+  "host": {
+    "os": "windows",
+    "asan": "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Tools\\MSVC\\14.51.36231\\bin\\Hostx64\\x64"
+  },
+  "parameters": {
+    "seconds_per_target": 3600,
+    "max_len": 32768,
+    "targets": [
+      "vault",
+      "identity_audit",
+      "policy_profile",
+      "dotenv"
+    ],
+    "minimize": true,
+    "coverage": true
+  },
+  "overall": "clean",
+  "results": [
+    {
+      "target": "vault",
+      "status": "clean",
+      "run_exit_code": 0,
+      "corpus_before": 1,
+      "corpus_after": 2334,
+      "new_artifacts": [],
+      "coverage": {
+        "report": "coverage/vault.txt",
+        "html": "coverage/vault-html",
+        "total": "TOTAL                                12357             12228     1.04%         800               792     1.00%        7959              7858     1.27%           0                 0         -"
+      },
+      "log": "logs/vault.log"
+    },
+    {
+      "target": "identity_audit",
+      "status": "clean",
+      "run_exit_code": 0,
+      "corpus_before": 10,
+      "corpus_after": 5729,
+      "new_artifacts": [],
+      "coverage": {
+        "report": null,
+        "html": null,
+        "total": "unavailable",
+        "note": "cargo fuzz coverage exited non-zero."
+      },
+      "log": "logs/identity_audit.log"
+    },
+    {
+      "target": "policy_profile",
+      "status": "clean",
+      "run_exit_code": 0,
+      "corpus_before": 2,
+      "corpus_after": 2044,
+      "new_artifacts": [],
+      "coverage": {
+        "report": "coverage/policy_profile.txt",
+        "html": "coverage/policy_profile-html",
+        "total": "TOTAL                                12357             12143     1.73%         800               781     2.38%        7959              7801     1.99%           0                 0         -"
+      },
+      "log": "logs/policy_profile.log"
+    },
+    {
+      "target": "dotenv",
+      "status": "clean",
+      "run_exit_code": 0,
+      "corpus_before": 1,
+      "corpus_after": 436,
+      "new_artifacts": [],
+      "coverage": {
+        "report": "coverage/dotenv.txt",
+        "html": "coverage/dotenv-html",
+        "total": "TOTAL                                12357             12099     2.09%         800               781     2.38%        7959              7810     1.87%           0                 0         -"
+      },
+      "log": "logs/dotenv.log"
+    }
+  ]
+}

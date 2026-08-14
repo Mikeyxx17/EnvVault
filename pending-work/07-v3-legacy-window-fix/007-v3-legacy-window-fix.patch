@@ -1,0 +1,73 @@
+diff --git a/src/identity/registry.rs b/src/identity/registry.rs
+index ec86868..4a26928 100644
+--- a/src/identity/registry.rs
++++ b/src/identity/registry.rs
+@@ -366,6 +366,7 @@ impl IdentityRegistryDocument {
+                         .map(DecodedRegistryEntry::from_legacy)
+                         .collect(),
+                     AuthenticationThrottleState::default(),
++                    true,
+                 )
+             }
+             THROTTLE_FORMAT_VERSION => {
+@@ -385,6 +386,7 @@ impl IdentityRegistryDocument {
+                         .map(DecodedRegistryEntry::from_legacy)
+                         .collect(),
+                     throttle,
++                    true,
+                 )
+             }
+             FORMAT_VERSION => {
+@@ -404,6 +406,7 @@ impl IdentityRegistryDocument {
+                         .map(DecodedRegistryEntry::from_v3)
+                         .collect(),
+                     throttle,
++                    false,
+                 )
+             }
+             _ => Err(IdentityRegistryError),
+@@ -416,6 +419,7 @@ impl IdentityRegistryDocument {
+         owner_kind: &str,
+         callers: Vec<DecodedRegistryEntry>,
+         authentication_throttle: AuthenticationThrottleState,
++        legacy_windows_allowed: bool,
+     ) -> Result<Self, IdentityRegistryError> {
+         if generation == 0
+             || owner_kind != CallerKind::Human.as_str()
+@@ -429,6 +433,12 @@ impl IdentityRegistryDocument {
+             if entry.kdf.algorithm != "argon2id" || entry.kdf.version != 19 {
+                 return Err(IdentityRegistryError);
+             }
++            if !legacy_windows_allowed
++                && (entry.credential_issued_unix_time_millis == 0
++                    || entry.credential_expires_unix_time_millis == u64::MAX)
++            {
++                return Err(IdentityRegistryError);
++            }
+             let caller_id = entry.caller_id.parse().map_err(|_| IdentityRegistryError)?;
+             let caller_kind = entry
+                 .caller_kind
+@@ -1036,8 +1046,7 @@ mod tests {
+         }
+ 
+         #[test]
+-        #[ignore = "finding (defense-in-depth): V3 documents accept the legacy (0, u64::MAX) credential window, so a tampered caller entry would hold an immortal credential; exploiting it still requires breaking the Vault AEAD envelope first"]
+-        fn v3_documents_still_accept_the_legacy_immortal_credential_window()
++        fn v3_documents_reject_the_legacy_immortal_credential_window()
+         -> Result<(), Box<dyn std::error::Error>> {
+             let mut registry = registry();
+             insert_caller(&mut registry, 0x41, 100)?;
+@@ -1045,12 +1054,7 @@ mod tests {
+             let mut immortal: serde_json::Value = serde_json::from_slice(&encoded)?;
+             immortal["callers"][0]["credential_issued_unix_time_millis"] = 0.into();
+             immortal["callers"][0]["credential_expires_unix_time_millis"] = u64::MAX.into();
+-            let decoded = IdentityRegistryDocument::decode(&serde_json::to_vec(&immortal)?)?;
+-            assert!(decoded.credential_is_active(
+-                caller(0x41),
+-                CallerKind::Application,
+-                u64::MAX - 1,
+-            ));
++            assert!(IdentityRegistryDocument::decode(&serde_json::to_vec(&immortal)?).is_err());
+             Ok(())
+         }
+ 

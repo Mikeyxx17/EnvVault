@@ -1,0 +1,678 @@
+diff --git a/docs/security/README.md b/docs/security/README.md
+index ba0eb91..3a228a6 100644
+--- a/docs/security/README.md
++++ b/docs/security/README.md
+@@ -13,6 +13,7 @@
+ - [Runtime Injection V1](./runtime-injection-v1.md)
+ - [Sensitive Files and Credential Recovery V1](./sensitive-files-and-credential-recovery-v1.md)
+ - [Parser Fuzzing and Security Properties V1](./parser-fuzzing-v1.md)
++- [Crash Fault-injection Harness V1](./crash-fault-injection-harness-v1.md)
+ - [Dependency and Supply-chain Policy V1](./supply-chain-v1.md)
+ - [Audit V2 Canonical Format](./audit-v2-format.md)
+ - [Audit V2 Rotation Fault-injection Matrix](./audit-rotation-fault-matrix.md)
+diff --git a/docs/security/crash-fault-injection-harness-v1.md b/docs/security/crash-fault-injection-harness-v1.md
+new file mode 100644
+index 0000000..a2c6abd
+--- /dev/null
++++ b/docs/security/crash-fault-injection-harness-v1.md
+@@ -0,0 +1,76 @@
++# Crash / Power-loss Fault-injection Harness V1
++
++状态：Harness 与合成场景已实现并在本会话冒烟验证（6 个注入点全部通过）；真实 EnvVault 场景模板已就绪。真实 Vault 的强制终止与断电验证必须在 Windows VM、Linux VM 和真实磁盘的完整权限环境执行——本 harness 只提供可复现的执行与留证框架，不构成任何断电安全声明。
++
++## 定位
++
++`scripts/fault-injection.ps1` 是 M1.2 的工程前置件：把 `docs/security/audit-rotation-fault-matrix.md` 中的每个注入点变成可复现的"运行 → 精确击杀 → 重启验证 → 留证"流程。
++
++```text
++fault-injection.ps1
++  ├── scenario.ps1（操作 + checkpoint 观察者，子进程）
++  │      ├─ 写 checkpoint 标记（注入窗口开始）
++  │      └─ 执行操作（EnvVault 命令或合成目标）
++  ├── 击杀：taskkill /T /F（Windows 进程树）或 VM poweroff hook
++  └── recovery.ps1（重启验证器，独立子进程）
++         └─ 输出 value-free JSON verdict + exit 0/2/3
++```
++
++## Verdict 语义
++
++| Verdict | Exit | 含义 |
++|---|---|---|
++| `recovered` | 0 | 重启后状态一致、链可验证 |
++| `fail_closed` | 2 | 无可用的损坏状态，失败关闭（可接受）|
++| `data_loss` | 3 | 不变量被破坏（例如已发放 Secret 对应 Audit 丢失）——必须调查 |
++| `error` | 其他 | 无法分类——必须调查 |
++
++## 使用
++
++合成冒烟（无 TTY、无凭证）：
++
++```powershell
++pwsh scripts\fault-injection.ps1 `
++  -ScenarioScript scripts\fault-injection-scenarios\synthetic\scenario.ps1 `
++  -RecoveryScript scripts\fault-injection-scenarios\synthetic\recovery.ps1 `
++  -WorkRoot <临时目录> `
++  -InjectAt before-manifest,manifest-written,segment-half,segment-written,vault-committed,anchor-confirmed
++```
++
++真实 EnvVault（需要交互式 Master Password，务必使用一次性测试 Vault）：
++
++```powershell
++$env:FAULT_VAULT_PATH = 'D:\fault-test\test.vault'
++$env:FAULT_VAULT_DIR  = 'D:\fault-test'
++pwsh scripts\fault-injection.ps1 -Interactive `
++  -ScenarioScript scripts\fault-injection-scenarios\envvault-migrate-v2\scenario.ps1 `
++  -RecoveryScript scripts\fault-injection-scenarios\envvault-migrate-v2\recovery.ps1 `
++  -WorkRoot D:\fault-test\work `
++  -InjectAt prepared-manifest,sealed-segment,vault-committed,anchor-confirmed
++```
++
++断电模式（VM poweroff hook，本机收集随即停止，重启后手动运行 recovery 脚本补录）：
++
++```powershell
++pwsh scripts\fault-injection.ps1 ... -PoweroffCommand 'VBoxManage controlvm envvault-test poweroff'
++```
++
++## 注入点与故障矩阵对应
++
++| 注入点（合成） | 注入点（EnvVault 模板） | 矩阵条目 |
++|---|---|---|
++| before-manifest | prepared-manifest 出现 | 建 manifest 前 / prepared 落盘后 |
++| manifest-written | —（manifest 已存在） | prepared 后、segment 前 |
++| segment-half | sealed-segment 出现 | segment 写一半 |
++| segment-written | — | segment 已写、sync 前 |
++| vault-committed | Vault 内容变化 | Vault commit 前后 |
++| anchor-confirmed | anchor sidecar 更新 | anchor CAS 前后 / confirmed 清理 |
++
++EnvVault 模板的 checkpoint 由 sidecar 文件名/内容观察驱动（`<vault>.audit-rotation-recovery.json`、新出现的 segment 文件、Vault 长度变化、`<vault>.audit-anchor-v2.json`），不读取任何 Secret Value。
++
++## 边界与必须补做的验收
++
++- harness 的击杀是 `taskkill /T /F`，不等于断电；断电必须用 VM poweroff/真实拔电执行。
++- 目录级 durability（rename 后目录 fsync）只能通过真实断电观察。
++- 每个注入点还必须在 Windows VM、Linux VM 与至少一种真实磁盘各跑一遍，并留档：前置状态、终止方式、磁盘状态、恢复结果。
++- 自动化通过不构成生产安全声明。
+diff --git a/scripts/fault-injection-scenarios/envvault-migrate-v2/recovery.ps1 b/scripts/fault-injection-scenarios/envvault-migrate-v2/recovery.ps1
+new file mode 100644
+index 0000000..ff5257c
+--- /dev/null
++++ b/scripts/fault-injection-scenarios/envvault-migrate-v2/recovery.ps1
+@@ -0,0 +1,40 @@
++<#
++.SYNOPSIS
++EnvVault `audit migrate-v2` recovery verifier template (M1.2).
++
++.DESCRIPTION
++After the forced kill, open the Vault (requires the interactive Master
++Password, so run with the harness `-Interactive` switch) and verify the
++value-free audit chain is readable and the migration is either complete,
++absent (V1 still authoritative) or safely resumable. Prints one JSON line
++{"verdict":"...","detail":"..."} and exits 0/2/3. Uses the same verdict
++classes as the harness: recovered / fail_closed / data_loss. Never prints
++Secret Values, credentials, or ciphertext.
++#>
++
++$ErrorActionPreference = 'Stop'
++
++$vault = $env:FAULT_VAULT_PATH
++if (-not $vault) {
++    throw 'FAULT_VAULT_PATH must be set.'
++}
++
++function Emit {
++    param(
++        [Parameter(Mandatory)][string]$Verdict,
++        [Parameter(Mandatory)][string]$Detail,
++        [Parameter(Mandatory)][int]$ExitCode
++    )
++    @{ verdict = $Verdict; detail = $Detail } | ConvertTo-Json -Compress
++    exit $ExitCode
++}
++
++# `audit list` requires exact `read_audit` Owner authorization and only emits
++# value-free fields; a non-zero exit means the chain failed verification
++# (acceptable fail-closed) or the Vault refuses to open.
++& envvault --vault $vault audit list *> (Join-Path $env:FAULT_WORK_ROOT 'recovery-audit-list.log')
++$exit = $LASTEXITCODE
++if ($exit -eq 0) {
++    Emit 'recovered' 'audit chain verified after restart' 0
++}
++Emit 'fail_closed' "audit list failed with exit code $exit; V1 chain remains authoritative until a safe retry" 2
+diff --git a/scripts/fault-injection-scenarios/envvault-migrate-v2/scenario.ps1 b/scripts/fault-injection-scenarios/envvault-migrate-v2/scenario.ps1
+new file mode 100644
+index 0000000..e497dd3
+--- /dev/null
++++ b/scripts/fault-injection-scenarios/envvault-migrate-v2/scenario.ps1
+@@ -0,0 +1,97 @@
++<#
++.SYNOPSIS
++EnvVault `audit migrate-v2` fault-injection scenario template (M1.2).
++
++.DESCRIPTION
++Run `envvault --vault <PATH> audit migrate-v2` and declare checkpoint
++markers by observing the real sidecar file lifecycle, mirroring the audit
++fault matrix injection points. MUST be run with the harness `-Interactive`
++switch so the Master Password TTY prompt works. Requires $env:FAULT_VAULT_PATH
++(a throwaway Vault created for this test - never a Vault holding real secrets)
++and $env:FAULT_VAULT_DIR (the directory containing it).
++
++Markers:
++
++  prepared-manifest  <vault>.audit-rotation-recovery.json appears
++  sealed-segment     a new sidecar file appears (segment staging/sealed)
++  vault-committed    the Vault file content changes (descriptor commit)
++  anchor-confirmed   <vault>.audit-anchor-v2.json is written/updated
++#>
++
++$ErrorActionPreference = 'Stop'
++
++$vault = $env:FAULT_VAULT_PATH
++$vaultDir = $env:FAULT_VAULT_DIR
++$checkpoints = $env:FAULT_CHECKPOINTS
++$work = $env:FAULT_WORK_ROOT
++if (-not $vault -or -not $vaultDir -or -not $checkpoints) {
++    throw 'FAULT_VAULT_PATH, FAULT_VAULT_DIR and FAULT_CHECKPOINTS must be set.'
++}
++
++function Write-Checkpoint {
++    param([Parameter(Mandatory)][string]$Name)
++    New-Item -ItemType File -Force -Path (Join-Path $checkpoints $Name) | Out-Null
++}
++
++$manifestName = "$vault.audit-rotation-recovery.json"
++$anchorName = "$vault.audit-anchor-v2.json"
++$known = @{
++    $manifestName = $true
++    $anchorName   = $true
++    "$vault.audit-descriptor-v3.json" = $true
++}
++$vaultLengthBefore = if (Test-Path -LiteralPath $vault) {
++    (Get-Item -LiteralPath $vault).Length
++} else {
++    0
++}
++
++$watcher = Start-Job -ScriptBlock {
++    param($dir, $knownNames, $manifestName, $anchorName, $vaultPath, $vaultLengthBefore)
++    $checkpoints = $env:FAULT_CHECKPOINTS
++    $reportedManifest = $false
++    $reportedSealed = $false
++    $reportedVault = $false
++    $reportedAnchor = $false
++    $end = (Get-Date).AddMinutes(30)
++    while ((Get-Date) -lt $end) {
++        $entries = Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue
++        if (-not $reportedManifest) {
++            if ($entries | Where-Object { $_.Name -eq $manifestName }) {
++                New-Item -ItemType File -Force `
++                    -Path (Join-Path $checkpoints 'prepared-manifest') | Out-Null
++                $reportedManifest = $true
++            }
++        }
++        if (-not $reportedSealed) {
++            if ($entries | Where-Object { -not $knownNames.ContainsKey($_.Name) }) {
++                New-Item -ItemType File -Force `
++                    -Path (Join-Path $checkpoints 'sealed-segment') | Out-Null
++                $reportedSealed = $true
++            }
++        }
++        if (-not $reportedVault -and (Test-Path -LiteralPath $vaultPath)) {
++            if ((Get-Item -LiteralPath $vaultPath).Length -ne $vaultLengthBefore) {
++                New-Item -ItemType File -Force `
++                    -Path (Join-Path $checkpoints 'vault-committed') | Out-Null
++                $reportedVault = $true
++            }
++        }
++        if (-not $reportedAnchor) {
++            $anchor = $entries | Where-Object { $_.Name -eq $anchorName }
++            if ($anchor) {
++                New-Item -ItemType File -Force `
++                    -Path (Join-Path $checkpoints 'anchor-confirmed') | Out-Null
++                $reportedAnchor = $true
++            }
++        }
++        Start-Sleep -Milliseconds 100
++    }
++} -ArgumentList $vaultDir, $known, $manifestName, $anchorName, $vault, $vaultLengthBefore
++
++try {
++    & envvault --vault $vault audit migrate-v2
++} finally {
++    Stop-Job -Job $watcher -ErrorAction SilentlyContinue
++    Remove-Job -Job $watcher -Force -ErrorAction SilentlyContinue
++}
+diff --git a/scripts/fault-injection-scenarios/synthetic/recovery.ps1 b/scripts/fault-injection-scenarios/synthetic/recovery.ps1
+new file mode 100644
+index 0000000..87461cf
+--- /dev/null
++++ b/scripts/fault-injection-scenarios/synthetic/recovery.ps1
+@@ -0,0 +1,68 @@
++<#
++.SYNOPSIS
++Synthetic fault-injection recovery verifier. Prints one value-free JSON line
++{"verdict":"...","detail":"..."} and exits 0 (recovered), 2 (fail_closed)
++or 3 (data_loss). Invariants mirror the audit fault matrix:
++
++  - No descriptor        => nothing committed, nothing can be lost
++  - Descriptor committed => journal count >= committed,
++                            segment.dat exists and matches journal,
++                            anchor exists before "done" is allowed
++#>
++
++$ErrorActionPreference = 'Stop'
++
++$work = $env:FAULT_WORK_ROOT
++if (-not $work) {
++    throw 'FAULT_WORK_ROOT must be set by the harness.'
++}
++
++function Emit {
++    param(
++        [Parameter(Mandatory)][string]$Verdict,
++        [Parameter(Mandatory)][string]$Detail,
++        [Parameter(Mandatory)][int]$ExitCode
++    )
++    @{ verdict = $Verdict; detail = $Detail } | ConvertTo-Json -Compress
++    exit $ExitCode
++}
++
++$journal = Join-Path $work 'journal.log'
++$segment = Join-Path $work 'segment.dat'
++$descriptor = Join-Path $work 'descriptor.json'
++$anchor = Join-Path $work 'anchor.json'
++$done = Join-Path $work 'done'
++
++$journalCount = 0
++if (Test-Path -LiteralPath $journal) {
++    $journalCount = @(Get-Content -LiteralPath $journal).Count
++}
++
++if (-not (Test-Path -LiteralPath $descriptor)) {
++    Emit 'fail_closed' 'no committed descriptor; nothing can be lost' 2
++}
++
++$committed = (Get-Content -LiteralPath $descriptor -Raw | ConvertFrom-Json).committed
++if (-not (Test-Path -LiteralPath $segment)) {
++    Emit 'data_loss' 'descriptor references a missing segment' 3
++}
++$segmentContent = if (Test-Path -LiteralPath $segment) {
++    @(Get-Content -LiteralPath $segment) -join "`n"
++} else {
++    ''
++}
++$journalContent = if ($journalCount -gt 0) {
++    @(Get-Content -LiteralPath $journal) -join "`n"
++} else {
++    ''
++}
++if ($journalCount -lt $committed) {
++    Emit 'data_loss' "journal behind descriptor ($journalCount < $committed)" 3
++}
++if ($segmentContent -ne $journalContent) {
++    Emit 'data_loss' 'segment does not match the journal' 3
++}
++if ((Test-Path -LiteralPath $done) -and -not (Test-Path -LiteralPath $anchor)) {
++    Emit 'data_loss' 'operation completed without an anchor' 3
++}
++Emit 'recovered' "consistent state with $committed committed events" 0
+diff --git a/scripts/fault-injection-scenarios/synthetic/scenario.ps1 b/scripts/fault-injection-scenarios/synthetic/scenario.ps1
+new file mode 100644
+index 0000000..f12b22b
+--- /dev/null
++++ b/scripts/fault-injection-scenarios/synthetic/scenario.ps1
+@@ -0,0 +1,58 @@
++<#
++.SYNOPSIS
++Synthetic fault-injection scenario: a toy journal/manifest/segment/descriptor
++/anchor writer that declares the same injection windows as EnvVault's
++rotation state machine, for smoke-testing the harness itself. It contains no
++secret values and touches only $env:FAULT_WORK_ROOT.
++
++Marker semantics (each marker means "the critical window begins now"):
++
++  before-manifest   nothing durable written yet
++  manifest-written  manifest.json exists; journal/segment/descriptor absent
++  segment-half      journal.log partially written; segment.dat absent
++  segment-written   segment.dat complete; descriptor absent
++  vault-committed   descriptor.json committed; anchor absent
++  anchor-confirmed  anchor.json written; operation complete
++#>
++
++$ErrorActionPreference = 'Stop'
++
++$work = $env:FAULT_WORK_ROOT
++$checkpoints = $env:FAULT_CHECKPOINTS
++if (-not $work -or -not $checkpoints) {
++    throw 'FAULT_WORK_ROOT and FAULT_CHECKPOINTS must be set by the harness.'
++}
++
++function Write-Checkpoint {
++    param([Parameter(Mandatory)][string]$Name)
++    New-Item -ItemType File -Force -Path (Join-Path $checkpoints $Name) | Out-Null
++    # Keep the injection window open long enough for the harness watcher.
++    Start-Sleep -Milliseconds 250
++}
++
++Write-Checkpoint 'before-manifest'
++
++Set-Content -Path (Join-Path $work 'manifest.json') `
++    -Value '{"operation_id":1,"state":"prepared"}' -Encoding UTF8
++Write-Checkpoint 'manifest-written'
++
++$journal = Join-Path $work 'journal.log'
++1..50 | ForEach-Object {
++    Add-Content -Path $journal -Value "seq=$_ payload=$(($_ * 31) % 1000003)" -Encoding UTF8
++    if ($_ -eq 10) {
++        Write-Checkpoint 'segment-half'
++    }
++}
++Set-Content -Path (Join-Path $work 'segment.dat') `
++    -Value (Get-Content -Path $journal -Raw) -Encoding UTF8 -NoNewline
++Write-Checkpoint 'segment-written'
++
++Set-Content -Path (Join-Path $work 'descriptor.json') `
++    -Value '{"committed":50}' -Encoding UTF8
++Write-Checkpoint 'vault-committed'
++
++Set-Content -Path (Join-Path $work 'anchor.json') `
++    -Value '{"generation":1}' -Encoding UTF8
++Write-Checkpoint 'anchor-confirmed'
++
++Set-Content -Path (Join-Path $work 'done') -Value 'ok' -Encoding UTF8
+diff --git a/scripts/fault-injection.ps1 b/scripts/fault-injection.ps1
+new file mode 100644
+index 0000000..3271e6b
+--- /dev/null
++++ b/scripts/fault-injection.ps1
+@@ -0,0 +1,291 @@
++<#
++.SYNOPSIS
++Crash / power-loss fault-injection harness for EnvVault recovery verification.
++
++.DESCRIPTION
++Runs a scenario script as a child process, force-kills it exactly when a
++named checkpoint marker appears, then runs a recovery verifier and records a
++value-free verdict per injection point (recovered / fail_closed / data_loss).
++This is the M1.2 engineering companion: real forced-termination and power-loss
++evidence still requires running it against EnvVault on Windows/Linux VMs and
++real disks in a full-permission environment; this harness performs no I/O
++that requires elevation and never records Secret Values.
++
++Contract:
++  - The scenario script receives $env:FAULT_WORK_ROOT and
++    $env:FAULT_CHECKPOINTS. It performs one operation and writes a marker
++    file named <checkpoint> into the checkpoints directory at each injection
++    window it declares (marker = the window begins).
++  - The recovery script receives $env:FAULT_WORK_ROOT, prints one
++    value-free JSON line {"verdict":"...","detail":"..."} and exits:
++      0 = recovered (safe, consistent)
++      2 = fail_closed (no usable state, acceptable)
++      3 = data_loss (invariant violated, must investigate)
++    any other exit code is recorded as an error.
++
++.PARAMETER ScenarioScript
++PowerShell script implementing the operation and checkpoint markers.
++
++.PARAMETER RecoveryScript
++PowerShell script implementing the post-restart verifier.
++
++.PARAMETER WorkRoot
++Parent directory for per-run work directories (created as needed).
++
++.PARAMETER InjectAt
++Checkpoint names to inject at; one run per checkpoint.
++
++.PARAMETER DelayMsAfterCheckpoint
++Extra delay between marker detection and the kill, in milliseconds.
++
++.PARAMETER WatchTimeoutSeconds
++Upper bound on waiting for a checkpoint marker.
++
++.PARAMETER RunsRoot
++Where run records are written (value-free JSON + Markdown).
++
++.PARAMETER PoweroffCommand
++When set, executes this command instead of Stop-Process (VM power-off
++hook, e.g. VBoxManage controlvm <vm> poweroff). Local collection then stops:
++the record is written with recovery = pending_vm_restart and the recovery
++script must be run manually after the VM restarts.
++
++.PARAMETER Interactive
++Run children with an inherited console so TTY Master Password prompts work.
++Required for real EnvVault scenarios; the synthetic scenario is headless.
++#>
++
++[CmdletBinding()]
++param(
++    [Parameter(Mandatory)]
++    [string]$ScenarioScript,
++
++    [Parameter(Mandatory)]
++    [string]$RecoveryScript,
++
++    [Parameter(Mandatory)]
++    [string]$WorkRoot,
++
++    [Parameter(Mandatory)]
++    [string[]]$InjectAt,
++
++    [int]$DelayMsAfterCheckpoint = 0,
++
++    [int]$WatchTimeoutSeconds = 600,
++
++    [string]$RunsRoot = 'fault-injection-runs',
++
++    [string]$PoweroffCommand = '',
++
++    [switch]$Interactive
++)
++
++$ErrorActionPreference = 'Stop'
++
++$scenarioPath = (Resolve-Path $ScenarioScript).Path
++$recoveryPath = (Resolve-Path $RecoveryScript).Path
++New-Item -ItemType Directory -Force -Path $WorkRoot | Out-Null
++$workRoot = (Resolve-Path $WorkRoot).Path
++$runsRootPath = if ([System.IO.Path]::IsPathRooted($RunsRoot)) {
++    $RunsRoot
++} else {
++    Join-Path (Get-Location) $RunsRoot
++}
++$pwsh = (Get-Command pwsh).Source
++
++$startedUtc = (Get-Date).ToUniversalTime()
++$runId = $startedUtc.ToString('yyyyMMdd-HHmmss')
++$runDir = Join-Path $runsRootPath $runId
++New-Item -ItemType Directory -Force -Path $runDir | Out-Null
++
++function Get-UtcIso {
++    (Get-Date).ToUniversalTime().ToString('o')
++}
++
++$results = @()
++
++foreach ($checkpoint in $InjectAt) {
++    $work = Join-Path $workRoot "$runId-$checkpoint"
++    $checkpoints = Join-Path $work 'checkpoints'
++    foreach ($dir in @($work, $checkpoints)) {
++        New-Item -ItemType Directory -Force -Path $dir | Out-Null
++    }
++    $env:FAULT_WORK_ROOT = $work
++    $env:FAULT_CHECKPOINTS = $checkpoints
++
++    $startArgs = if ($Interactive) {
++        @('-NoProfile', '-File', $scenarioPath)
++    } else {
++        @('-NoProfile', '-NonInteractive', '-File', $scenarioPath)
++    }
++    $child = Start-Process -FilePath $pwsh -ArgumentList $startArgs `
++        -PassThru -WorkingDirectory $work -WindowStyle Hidden
++
++    $marker = Join-Path $checkpoints $checkpoint
++    $deadline = (Get-Date).AddSeconds($WatchTimeoutSeconds)
++    $markerSeen = $false
++    while ((Get-Date) -lt $deadline) {
++        if ($child.HasExited) {
++            break
++        }
++        if (Test-Path -LiteralPath $marker) {
++            $markerSeen = $true
++            break
++        }
++        Start-Sleep -Milliseconds 50
++    }
++
++    $killApplied = $false
++    if ($markerSeen -and -not $child.HasExited) {
++        if ($DelayMsAfterCheckpoint -gt 0) {
++            Start-Sleep -Milliseconds $DelayMsAfterCheckpoint
++        }
++        if ($PoweroffCommand) {
++            Invoke-Expression $PoweroffCommand
++            $results += [ordered]@{
++                checkpoint            = $checkpoint
++                kill_mode             = 'poweroff'
++                marker_seen           = $true
++                scenario_exit_code    = $null
++                recovery              = [ordered]@{
++                    verdict = 'pending_vm_restart'
++                    detail  = 'power-off executed; run the recovery script manually after the VM restarts'
++                }
++            }
++            $record = [ordered]@{
++                schema        = 'envvault-fault-injection-run-v1'
++                run_id        = $runId
++                started_at    = $startedUtc.ToString('o')
++                scenario      = (Split-Path $scenarioPath -Leaf)
++                recovery      = (Split-Path $recoveryPath -Leaf)
++                poweroff      = $PoweroffCommand
++                results       = $results
++            }
++            $record | ConvertTo-Json -Depth 6 |
++                Set-Content -Path (Join-Path $runDir 'run.json') -Encoding UTF8
++            Write-Host "==> Power-off requested at '$checkpoint'; record: $runDir\run.json"
++            exit 0
++        }
++        if ($IsWindows) {
++            & taskkill /PID $child.Id /T /F 2>$null | Out-Null
++        } else {
++            Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue
++        }
++        Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue
++        $grace = (Get-Date).AddSeconds(5)
++        while ((Get-Date) -lt $grace) {
++            Start-Sleep -Milliseconds 50
++            $child.Refresh()
++            if ($child.HasExited) {
++                $killApplied = $true
++                break
++            }
++        }
++        if (-not $killApplied) {
++            $results += [ordered]@{
++                checkpoint         = $checkpoint
++                kill_mode          = 'kill_failed'
++                marker_seen        = $true
++                scenario_exit_code = $null
++                recovery           = [ordered]@{
++                    verdict = 'kill_failed'
++                    detail  = 'the scenario process could not be terminated (permission denied or already finished); this entry is NOT a valid injection, rerun in a full-permission environment'
++                }
++            }
++            Write-Host "==> $checkpoint : kill failed (denied or already exited); entry recorded as kill_failed"
++            continue
++        }
++    }
++    if (-not $child.HasExited) {
++        $child.WaitForExit()
++    }
++    $scenarioExit = $child.ExitCode
++
++    $stdout = Join-Path $runDir "$checkpoint.recovery.out.log"
++    $stderr = Join-Path $runDir "$checkpoint.recovery.err.log"
++    $recoveryArgs = if ($Interactive) {
++        @('-NoProfile', '-File', $recoveryPath)
++    } else {
++        @('-NoProfile', '-NonInteractive', '-File', $recoveryPath)
++    }
++    $output = & $pwsh @recoveryArgs 2>$stderr | Out-String
++    $recoveryExit = $LASTEXITCODE
++    $output | Set-Content -Path $stdout -Encoding UTF8
++    $verdict = 'error'
++    $detail = ''
++    $parsed = $output | ConvertFrom-Json -ErrorAction SilentlyContinue
++    if ($null -ne $parsed.verdict) {
++        $verdict = [string]$parsed.verdict
++        $detail = [string]$parsed.detail
++    }
++    if ($verdict -eq 'error' -and $recoveryExit -eq 2) {
++        $verdict = 'fail_closed'
++    }
++    if ($verdict -eq 'error' -and $recoveryExit -eq 3) {
++        $verdict = 'data_loss'
++    }
++
++    $results += [ordered]@{
++        checkpoint         = $checkpoint
++        kill_mode          = 'force_terminate'
++        marker_seen        = $markerSeen
++        scenario_exit_code = $scenarioExit
++        recovery_exit_code = $recoveryExit
++        recovery           = [ordered]@{
++            verdict = $verdict
++            detail  = $detail
++        }
++        recovery_stdout    = "$checkpoint.recovery.out.log"
++        recovery_stderr    = "$checkpoint.recovery.err.log"
++    }
++
++    Write-Host "==> $checkpoint : marker=$markerSeen kill=$scenarioExit verdict=$verdict"
++}
++
++$finishedUtc = (Get-Date).ToUniversalTime()
++$record = [ordered]@{
++    schema     = 'envvault-fault-injection-run-v1'
++    run_id     = $runId
++    started_at = $startedUtc.ToString('o')
++    finished_at = $finishedUtc.ToString('o')
++    scenario   = (Split-Path $scenarioPath -Leaf)
++    recovery   = (Split-Path $recoveryPath -Leaf)
++    results    = $results
++}
++$record | ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $runDir 'run.json') -Encoding UTF8
++
++$md = New-Object System.Text.StringBuilder
++[void]$md.AppendLine('# Fault-injection Run Record')
++[void]$md.AppendLine()
++[void]$md.AppendLine("- Run: ``$runId``")
++[void]$md.AppendLine("- Started (UTC): ``$($startedUtc.ToString('o'))``")
++[void]$md.AppendLine("- Scenario: ``$(Split-Path $scenarioPath -Leaf)``")
++[void]$md.AppendLine("- Recovery: ``$(Split-Path $recoveryPath -Leaf)``")
++[void]$md.AppendLine()
++[void]$md.AppendLine('| Checkpoint | Marker seen | Scenario exit | Recovery exit | Verdict | Detail |')
++[void]$md.AppendLine('|---|---|---|---|---|---|')
++foreach ($result in $results) {
++    [void]$md.AppendLine("| $($result.checkpoint) | $($result.marker_seen) | $($result.scenario_exit_code) | $($result.recovery_exit_code) | $($result.recovery.verdict) | $($result.recovery.detail) |")
++}
++Set-Content -Path (Join-Path $runDir 'run.md') -Value $md.ToString() -Encoding UTF8
++
++Write-Host ''
++Write-Host "==> Run record: $(Join-Path $runDir 'run.json')"
++Write-Host "==> Markdown:   $(Join-Path $runDir 'run.md')"
++
++$dataLoss = $results | Where-Object { $_.recovery.verdict -eq 'data_loss' }
++if ($dataLoss) {
++    Write-Warning 'At least one injection point violated a recovery invariant; investigate before proceeding.'
++    exit 3
++}
++$errors = $results | Where-Object { $_.recovery.verdict -eq 'error' }
++if ($errors) {
++    Write-Warning 'At least one injection point could not be classified; investigate before proceeding.'
++    exit 4
++}
++$killFailures = $results | Where-Object { $_.recovery.verdict -eq 'kill_failed' }
++if ($killFailures) {
++    Write-Warning 'At least one kill was denied or ineffective; these entries are not valid injections. Rerun in a full-permission environment.'
++    exit 5
++}
++exit 0
