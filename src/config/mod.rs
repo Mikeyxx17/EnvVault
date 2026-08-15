@@ -330,7 +330,9 @@ mod tests {
         let project = default_layout(root.path());
         write_new(&project)?;
 
-        let found = discover(&nested)?.expect("project");
+        let Some(found) = discover(&nested)? else {
+            return Err("project file was not discovered".into());
+        };
         assert_eq!(found.vault(), root.path().join(".envvault/vault"));
         assert_eq!(
             found.profile(),
@@ -349,19 +351,19 @@ mod tests {
             &path,
             r#"{"format":"envvault-project","version":1,"vault":".envvault/vault","extra":true}"#,
         )?;
-        assert_eq!(load(&path).unwrap_err(), ProjectError::InvalidFormat);
+        assert!(matches!(load(&path), Err(ProjectError::InvalidFormat)));
 
         fs::write(
             &path,
             r#"{"format":"envvault-project","version":1,"vault":"../other.vault"}"#,
         )?;
-        assert_eq!(load(&path).unwrap_err(), ProjectError::InvalidFormat);
+        assert!(matches!(load(&path), Err(ProjectError::InvalidFormat)));
 
         fs::write(
             &path,
             r#"{"format":"envvault-project","version":1,"vault":"/tmp/x.vault"}"#,
         )?;
-        assert_eq!(load(&path).unwrap_err(), ProjectError::InvalidFormat);
+        assert!(matches!(load(&path), Err(ProjectError::InvalidFormat)));
         Ok(())
     }
 

@@ -107,15 +107,12 @@ fn try_disable_keystore(
     sensitive_input: &mut dyn SensitiveInput,
     output: &mut dyn Write,
 ) {
-    let password = match sensitive_input.read_existing() {
-        Ok(password) => password,
-        Err(_) => {
-            let _ignored = writeln!(
-                output,
-                "keystore disable skipped: master password was not available"
-            );
-            return;
-        }
+    let Ok(password) = sensitive_input.read_existing() else {
+        let _ignored = writeln!(
+            output,
+            "keystore disable skipped: master password was not available"
+        );
+        return;
     };
     match CliApplication::open_owner(project.vault(), &password)
         .and_then(|mut application| application.disable_machine_unlock())

@@ -47,80 +47,60 @@ pub(super) fn execute(
         return Ok(ExecutionOutcome::Success);
     }
     let vault = resolve_vault(cli.vault.as_deref(), project.as_ref(), &cli.command)?;
+    dispatch(cli, &vault, project.as_mut(), sensitive_input, output)
+}
+
+fn dispatch(
+    cli: Cli,
+    vault: &Path,
+    mut project: Option<&mut Project>,
+    sensitive_input: &mut dyn SensitiveInput,
+    output: &mut dyn Write,
+) -> Result<ExecutionOutcome, CliError> {
     match cli.command {
-        Command::Init => execute_init(&vault, cli.vault.is_none(), sensitive_input, output)?,
-        Command::Set { name } => {
-            let name = SecretName::new(name)?;
-            let password = sensitive_input.read_existing()?;
-            let mut application = CliApplication::open_owner(&vault, &password)?;
-            let value = sensitive_input.read_secret_value()?;
-            let record = application.set_secret(name, &value)?;
-            writeln!(output, "Secret stored")?;
-            writeln!(output, "secret_id: {}", record.id())?;
-        }
-        Command::Verify { name } => {
-            execute_verify(&vault, name, sensitive_input, output)?;
-        }
-        Command::List => {
-            let password = sensitive_input.read_existing()?;
-            let mut application = CliApplication::open_owner(&vault, &password)?;
-            for record in application.list_secrets()? {
-                writeln!(output, "{}", record.name())?;
-            }
-        }
-        Command::Exists { name } => {
-            let name = SecretName::new(name)?;
-            let password = sensitive_input.read_existing()?;
-            let mut application = CliApplication::open_owner(&vault, &password)?;
-            writeln!(output, "{}", application.secret_exists(&name)?)?;
-        }
-        Command::Remove { name } => {
-            let name = SecretName::new(name)?;
-            let password = sensitive_input.read_existing()?;
-            let mut application = CliApplication::open_owner(&vault, &password)?;
-            application.remove_secret(&name)?;
-            writeln!(output, "Secret removed")?;
-        }
-        Command::Import { source } => {
-            let password = sensitive_input.read_existing()?;
-            let mut application = CliApplication::open_owner(&vault, &password)?;
-            let source_bytes = read_source(&source)?;
-            let entries = dotenv::parse(&source_bytes)?;
-            drop(source_bytes);
-            let imported = application.import_secrets(entries)?;
-            writeln!(output, "Imported {} Secrets", imported.len())?;
-            writeln!(output, "source_preserved: yes")?;
-        }
+        Command::Init => execute_init(vault, cli.vault.is_none(), sensitive_input, output)?,
+        Command::Set { name } => execute_set(vault, name, sensitive_input, output)?,
+        Command::Verify { name } => execute_verify(vault, name, sensitive_input, output)?,
+        Command::List => execute_list(vault, sensitive_input, output)?,
+        Command::Exists { name } => execute_exists(vault, name, sensitive_input, output)?,
+        Command::Remove { name } => execute_remove(vault, name, sensitive_input, output)?,
+        Command::Import { source } => execute_import(vault, &source, sensitive_input, output)?,
         Command::Example { output: path } => {
-            let password = sensitive_input.read_existing()?;
-            let mut application = CliApplication::open_owner(&vault, &password)?;
-            let records = application.list_secrets()?;
-            let example = dotenv::render_example(records.iter().map(SecretRecord::name))?;
-            write_new(&path, &example)?;
-            writeln!(output, "Example generated")?;
-            writeln!(output, "example_file_created: yes")?;
+            execute_example(vault, &path, sensitive_input, output)?;
         }
         Command::Identity { command } => {
-            execute_identity(&vault, command, project.as_mut(), sensitive_input, output)?;
+            execute_identity(
+                vault,
+                command,
+                project.as_deref_mut(),
+                sensitive_input,
+                output,
+            )?;
         }
         Command::Profile { command } => {
-            execute_profile(&vault, command, project.as_mut(), sensitive_input, output)?;
+            execute_profile(
+                vault,
+                command,
+                project.as_deref_mut(),
+                sensitive_input,
+                output,
+            )?;
         }
         Command::Policy { command } => {
-            execute_policy(&vault, command, project.as_ref(), sensitive_input, output)?;
+            execute_policy(vault, command, project.as_deref(), sensitive_input, output)?;
         }
-        Command::Audit { command } => execute_audit(&vault, command, sensitive_input, output)?,
+        Command::Audit { command } => execute_audit(vault, command, sensitive_input, output)?,
         Command::Keystore { command } => {
-            execute_keystore(&vault, command, sensitive_input, output)?;
+            execute_keystore(vault, command, sensitive_input, output)?;
         }
         Command::Session {
             credential_file,
             machine_unlock,
             command,
         } => {
-            let credential_file = resolve_credential(credential_file, project.as_ref())?;
+            let credential_file = resolve_credential(credential_file, project.as_deref())?;
             execute_session(
-                &vault,
+                vault,
                 &credential_file,
                 machine_unlock,
                 command,
@@ -134,10 +114,10 @@ pub(super) fn execute(
             machine_unlock,
             command,
         } => {
-            let profile = resolve_profile(profile, project.as_ref())?;
-            let credential_file = resolve_credential(credential_file, project.as_ref())?;
+            let profile = resolve_profile(profile, project.as_deref())?;
+            let credential_file = resolve_credential(credential_file, project.as_deref())?;
             return execute_run(
-                &vault,
+                vault,
                 &profile,
                 &credential_file,
                 &command,
@@ -147,10 +127,99 @@ pub(super) fn execute(
             .map(ExecutionOutcome::Child);
         }
         Command::Uninstall { purge_project } => {
-            super::uninstall::execute(purge_project, project.as_ref(), sensitive_input, output)?;
+            super::uninstall::execute(purge_project, project.as_deref(), sensitive_input, output)?;
         }
     }
     Ok(ExecutionOutcome::Success)
+}
+
+fn execute_set(
+    vault: &Path,
+    name: String,
+    sensitive_input: &mut dyn SensitiveInput,
+    output: &mut dyn Write,
+) -> Result<(), CliError> {
+    let name = SecretName::new(name)?;
+    let password = sensitive_input.read_existing()?;
+    let mut application = CliApplication::open_owner(vault, &password)?;
+    let value = sensitive_input.read_secret_value()?;
+    let record = application.set_secret(name, &value)?;
+    writeln!(output, "Secret stored")?;
+    writeln!(output, "secret_id: {}", record.id())?;
+    Ok(())
+}
+
+fn execute_list(
+    vault: &Path,
+    sensitive_input: &mut dyn SensitiveInput,
+    output: &mut dyn Write,
+) -> Result<(), CliError> {
+    let password = sensitive_input.read_existing()?;
+    let mut application = CliApplication::open_owner(vault, &password)?;
+    for record in application.list_secrets()? {
+        writeln!(output, "{}", record.name())?;
+    }
+    Ok(())
+}
+
+fn execute_exists(
+    vault: &Path,
+    name: String,
+    sensitive_input: &mut dyn SensitiveInput,
+    output: &mut dyn Write,
+) -> Result<(), CliError> {
+    let name = SecretName::new(name)?;
+    let password = sensitive_input.read_existing()?;
+    let mut application = CliApplication::open_owner(vault, &password)?;
+    writeln!(output, "{}", application.secret_exists(&name)?)?;
+    Ok(())
+}
+
+fn execute_remove(
+    vault: &Path,
+    name: String,
+    sensitive_input: &mut dyn SensitiveInput,
+    output: &mut dyn Write,
+) -> Result<(), CliError> {
+    let name = SecretName::new(name)?;
+    let password = sensitive_input.read_existing()?;
+    let mut application = CliApplication::open_owner(vault, &password)?;
+    application.remove_secret(&name)?;
+    writeln!(output, "Secret removed")?;
+    Ok(())
+}
+
+fn execute_import(
+    vault: &Path,
+    source: &Path,
+    sensitive_input: &mut dyn SensitiveInput,
+    output: &mut dyn Write,
+) -> Result<(), CliError> {
+    let password = sensitive_input.read_existing()?;
+    let mut application = CliApplication::open_owner(vault, &password)?;
+    let source_bytes = read_source(source)?;
+    let entries = dotenv::parse(&source_bytes)?;
+    drop(source_bytes);
+    let imported = application.import_secrets(entries)?;
+    writeln!(output, "Imported {} Secrets", imported.len())?;
+    writeln!(output, "source_preserved: yes")?;
+    Ok(())
+}
+
+fn execute_example(
+    vault: &Path,
+    path: &Path,
+    sensitive_input: &mut dyn SensitiveInput,
+    output: &mut dyn Write,
+) -> Result<(), CliError> {
+    let password = sensitive_input.read_existing()?;
+    let mut application = CliApplication::open_owner(vault, &password)?;
+    let records = application.list_secrets()?;
+    let example = dotenv::render_example(records.iter().map(SecretRecord::name))?;
+    write_new(path, &example)?;
+    writeln!(output, "Example generated")?;
+    writeln!(output, "example_file_created: yes")?;
+    Ok(())
 }
 
 fn execute_verify(
