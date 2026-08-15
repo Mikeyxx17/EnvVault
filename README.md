@@ -18,7 +18,7 @@ Master Password Owner bootstrap、显式 Vault 管理规则、Application/AI Age
 
 Windows 敏感文件专用 DACL、路径重解析点拒绝、credential 交付恢复日志、parser fuzz/property/负向泄漏测试、依赖/许可证/来源策略，以及 Audit V2 event/segment、Manifest V2、Descriptor V3 key envelopes、Broker/CLI 活动段、自动轮换/启动恢复、本地镜像 CAS、显式 V1→V2 迁移和 mandatory degraded 原语已完成第一版代码与本机验证。Windows Credential Manager、Linux Secret Service 与 macOS Keychain machine unlock adapter、可恢复代次轮换、显式 `run --machine-unlock`、成功/失败身份认证审计、持久化认证限流、Identity Registry V3 严格 90 天 credential expiry 和 value-free `session whoami` 也已接入；三平台真实凭据库验收、真正远程/硬件单调锚点、已实际运行的长期 fuzz campaign、对抗性进程终止/断电注入和独立安全验收仍未完成，因此当前版本仍不能用于保存真实 Secret。导入不会修改或安全删除源 `.env`；`run` 也不是阻止目标程序、同用户恶意进程或 AI Agent 泄漏 Secret 的沙箱。
 
-项目最高级需求见 [EnvVault 项目定义.md](./EnvVault%20项目定义.md)，文档入口见 [docs/README.md](./docs/README.md)。
+项目最高级需求见 [EnvVault 项目定义.md](./EnvVault%20项目定义.md)，文档入口见 [docs/README.md](./docs/README.md)。在其他电脑上从源码构建见 [docs/构建说明.md](./docs/构建说明.md)。
 
 ## 工程结构
 
