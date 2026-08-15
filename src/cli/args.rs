@@ -7,7 +7,7 @@ use crate::identity::{CallerId, CallerKind};
 #[derive(Debug, Parser)]
 #[command(name = "envvault", version, about)]
 pub(super) struct Cli {
-    /// Encrypted Vault file to operate on.
+    /// Encrypted Vault file. Defaults to `vault` in `envvault.json`.
     #[arg(long, global = true, value_name = "PATH")]
     pub(super) vault: Option<PathBuf>,
 
@@ -85,7 +85,7 @@ pub(super) enum Command {
     Session {
         /// Registered Application or AI Agent credential file.
         #[arg(long, value_name = "PATH")]
-        credential_file: PathBuf,
+        credential_file: Option<PathBuf>,
         /// Unlock through the OS credential store without a Master Password prompt.
         #[arg(long)]
         machine_unlock: bool,
@@ -96,16 +96,22 @@ pub(super) enum Command {
     Run {
         /// Strict value-free Profile file.
         #[arg(long, value_name = "PATH")]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         /// Registered Application or AI Agent credential file.
         #[arg(long, value_name = "PATH")]
-        credential_file: PathBuf,
+        credential_file: Option<PathBuf>,
         /// Unlock through the OS credential store without a Master Password prompt.
         #[arg(long)]
         machine_unlock: bool,
         /// Exact program and arguments following `--`; no shell is introduced.
         #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
+    },
+    /// Remove the installed `envvault` binary. Vaults are kept unless `--purge-project`.
+    Uninstall {
+        /// Also delete this project's `.envvault/` directory and `envvault.json`.
+        #[arg(long)]
+        purge_project: bool,
     },
 }
 
@@ -145,9 +151,9 @@ pub(super) enum IdentityCommand {
         /// Unique management label (not used for policy matching).
         #[arg(long)]
         name: String,
-        /// New credential file; an existing path is never overwritten.
+        /// New credential file; defaults to `.envvault/<name>.credential.json`.
         #[arg(long, value_name = "PATH")]
-        credential_file: PathBuf,
+        credential_file: Option<PathBuf>,
     },
     /// List registered non-Human callers without credential material.
     List,
@@ -172,9 +178,9 @@ pub(super) enum IdentityCommand {
 pub(super) enum ProfileCommand {
     /// Resolve authorized Secret names and write a new value-free Profile.
     Create {
-        /// New Profile file; an existing path is never overwritten.
+        /// New Profile file; defaults to the path in `envvault.json`.
         #[arg(long, value_name = "PATH")]
-        output: PathBuf,
+        output: Option<PathBuf>,
         /// Secret names, also used as the child environment keys.
         #[arg(required = true, num_args = 1..)]
         secrets: Vec<String>,
@@ -187,10 +193,10 @@ pub(super) enum PolicyCommand {
     GrantUse {
         /// Registered Application or AI Agent caller receiving the grants.
         #[arg(long)]
-        caller_id: CallerId,
+        caller_id: Option<CallerId>,
         /// Strict value-free Profile whose exact `SecretIds` are granted.
         #[arg(long, value_name = "PATH")]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
 }
 

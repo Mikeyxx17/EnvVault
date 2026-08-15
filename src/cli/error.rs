@@ -2,8 +2,8 @@ use core::fmt;
 use std::io;
 
 use crate::{
-    broker::BrokerError, dotenv::DotenvError, identity::CallerNameError, process::ProcessError,
-    profile::ProfileError, secret::SecretNameError,
+    broker::BrokerError, config::ProjectError, dotenv::DotenvError, identity::CallerNameError,
+    process::ProcessError, profile::ProfileError, secret::SecretNameError,
 };
 
 /// Safe CLI failure categories that never carry password or credential bytes.
@@ -12,6 +12,8 @@ pub(super) enum CliError {
     Broker(BrokerError),
     Keystore(crate::keystore::KeystoreError),
     VaultPathRequired,
+    Project(ProjectError),
+    ProjectDefaultMissing,
     InvalidCallerName,
     PasswordInputUnavailable,
     SecretInputUnavailable,
@@ -29,6 +31,9 @@ pub(super) enum CliError {
     ProfileFileInvalid,
     Process(ProcessError),
     OutputUnavailable,
+    ConfirmationUnavailable,
+    ConfirmationRejected,
+    UninstallUnavailable,
 }
 
 impl fmt::Display for CliError {
@@ -36,7 +41,13 @@ impl fmt::Display for CliError {
         match self {
             Self::Broker(error) => error.fmt(formatter),
             Self::Keystore(error) => error.fmt(formatter),
-            Self::VaultPathRequired => formatter.write_str("--vault PATH is required"),
+            Self::VaultPathRequired => formatter.write_str(
+                "no Vault path: pass --vault PATH or add envvault.json in this project",
+            ),
+            Self::Project(error) => error.fmt(formatter),
+            Self::ProjectDefaultMissing => formatter.write_str(
+                "project default path is missing; pass the flag or set it in envvault.json",
+            ),
             Self::InvalidCallerName => formatter.write_str("invalid caller name"),
             Self::PasswordInputUnavailable => formatter
                 .write_str("master password input requires an attached interactive terminal"),
@@ -75,11 +86,26 @@ impl fmt::Display for CliError {
             Self::ProfileFileInvalid => formatter.write_str("Profile file is invalid"),
             Self::Process(error) => error.fmt(formatter),
             Self::OutputUnavailable => formatter.write_str("command output is unavailable"),
+            Self::ConfirmationUnavailable => formatter.write_str(
+                "uninstall confirmation requires an attached interactive terminal",
+            ),
+            Self::ConfirmationRejected => {
+                formatter.write_str("confirmation phrase did not match; nothing was deleted")
+            }
+            Self::UninstallUnavailable => {
+                formatter.write_str("uninstall could not complete safely")
+            }
         }
     }
 }
 
 impl std::error::Error for CliError {}
+
+impl From<ProjectError> for CliError {
+    fn from(value: ProjectError) -> Self {
+        Self::Project(value)
+    }
+}
 
 impl From<BrokerError> for CliError {
     fn from(value: BrokerError) -> Self {

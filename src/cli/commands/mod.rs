@@ -3,7 +3,13 @@
 //! Handlers will translate user intent into broker or administrative requests;
 //! they must not bypass authorization or vault boundaries.
 
-use std::{ffi::OsString, io::Write, path::Path, process::ExitStatus};
+use std::{
+    env,
+    ffi::OsString,
+    io::Write,
+    path::{Path, PathBuf},
+    process::ExitStatus,
+};
 
 use crate::cli::{
     application::CliApplication,
@@ -20,6 +26,7 @@ use crate::cli::{
     profile_file::{read as read_profile, write_new as write_new_profile},
 };
 use crate::{
+    config::{self, Project},
     dotenv, process,
     secret::{SecretName, SecretRecord},
 };
@@ -34,9 +41,14 @@ pub(super) fn execute(
     sensitive_input: &mut dyn SensitiveInput,
     output: &mut dyn Write,
 ) -> Result<ExecutionOutcome, CliError> {
-    let vault = cli.vault.ok_or(CliError::VaultPathRequired)?;
+    let mut project = config::discover_from_cwd()?;
+    if let Command::Uninstall { purge_project } = cli.command {
+        super::uninstall::execute(purge_project, project.as_ref(), sensitive_input, output)?;
+        return Ok(ExecutionOutcome::Success);
+    }
+    let vault = resolve_vault(cli.vault.as_deref(), project.as_ref(), &cli.command)?;
     match cli.command {
-        Command::Init => execute_init(&vault, sensitive_input, output)?,
+        Command::Init => execute_init(&vault, cli.vault.is_none(), sensitive_input, output)?,
         Command::Set { name } => {
             let name = SecretName::new(name)?;
             let password = sensitive_input.read_existing()?;
@@ -89,13 +101,13 @@ pub(super) fn execute(
             writeln!(output, "example_file_created: yes")?;
         }
         Command::Identity { command } => {
-            execute_identity(&vault, command, sensitive_input, output)?;
+            execute_identity(&vault, command, project.as_mut(), sensitive_input, output)?;
         }
         Command::Profile { command } => {
-            execute_profile(&vault, command, sensitive_input, output)?;
+            execute_profile(&vault, command, project.as_mut(), sensitive_input, output)?;
         }
         Command::Policy { command } => {
-            execute_policy(&vault, command, sensitive_input, output)?;
+            execute_policy(&vault, command, project.as_ref(), sensitive_input, output)?;
         }
         Command::Audit { command } => execute_audit(&vault, command, sensitive_input, output)?,
         Command::Keystore { command } => {
@@ -106,6 +118,7 @@ pub(super) fn execute(
             machine_unlock,
             command,
         } => {
+            let credential_file = resolve_credential(credential_file, project.as_ref())?;
             execute_session(
                 &vault,
                 &credential_file,
@@ -121,6 +134,8 @@ pub(super) fn execute(
             machine_unlock,
             command,
         } => {
+            let profile = resolve_profile(profile, project.as_ref())?;
+            let credential_file = resolve_credential(credential_file, project.as_ref())?;
             return execute_run(
                 &vault,
                 &profile,
@@ -130,6 +145,9 @@ pub(super) fn execute(
                 sensitive_input,
             )
             .map(ExecutionOutcome::Child);
+        }
+        Command::Uninstall { purge_project } => {
+            super::uninstall::execute(purge_project, project.as_ref(), sensitive_input, output)?;
         }
     }
     Ok(ExecutionOutcome::Success)
@@ -152,24 +170,44 @@ fn execute_verify(
 
 fn execute_init(
     vault: &Path,
+    write_project_file: bool,
     sensitive_input: &mut dyn SensitiveInput,
     output: &mut dyn Write,
 ) -> Result<(), CliError> {
+    if let Some(parent) = vault.parent() {
+        config::ensure_vault_dir(parent)?;
+    }
     let password = sensitive_input.read_new()?;
     let owner = CliApplication::init(vault, &password)?;
     writeln!(output, "Vault initialized")?;
     writeln!(output, "owner_id: {}", owner.id())?;
+    if write_project_file {
+        let cwd = env::current_dir().map_err(|_| CliError::OutputUnavailable)?;
+        let project = config::default_layout(&cwd);
+        match config::write_new(&project) {
+            Ok(()) => {
+                writeln!(output, "project_file: {}", project.file_path().display())?;
+            }
+            Err(config::ProjectError::AlreadyExists) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     Ok(())
 }
 
 fn execute_policy(
     vault: &Path,
     command: PolicyCommand,
+    project: Option<&Project>,
     sensitive_input: &mut dyn SensitiveInput,
     output: &mut dyn Write,
 ) -> Result<(), CliError> {
     match command {
         PolicyCommand::GrantUse { caller_id, profile } => {
+            let caller_id = caller_id
+                .or_else(|| project.and_then(Project::caller_id))
+                .ok_or(CliError::ProjectDefaultMissing)?;
+            let profile = resolve_profile(profile, project)?;
             let profile = read_profile(&profile)?;
             let password = sensitive_input.read_existing()?;
             let mut application = CliApplication::open_owner(vault, &password)?;
@@ -265,6 +303,7 @@ fn write_audit_event(
 fn execute_profile(
     vault: &Path,
     command: ProfileCommand,
+    project: Option<&mut Project>,
     sensitive_input: &mut dyn SensitiveInput,
     output: &mut dyn Write,
 ) -> Result<(), CliError> {
@@ -277,10 +316,17 @@ fn execute_profile(
                 .into_iter()
                 .map(SecretName::new)
                 .collect::<Result<Vec<_>, _>>()?;
+            let path = resolve_profile(path, project.as_deref())?;
+            if let Some(parent) = path.parent() {
+                config::ensure_vault_dir(parent)?;
+            }
             let password = sensitive_input.read_existing()?;
             let mut application = CliApplication::open_owner(vault, &password)?;
             let profile = application.create_profile(names)?;
             write_new_profile(&path, &profile)?;
+            if let Some(project) = project {
+                project.set_default_profile(&path)?;
+            }
             writeln!(output, "Profile created")?;
             writeln!(output, "bindings: {}", profile.bindings().len())?;
             writeln!(output, "profile_file_created: yes")?;
@@ -358,6 +404,7 @@ fn open_machine_caller(
 fn execute_identity(
     vault: &Path,
     command: IdentityCommand,
+    mut project: Option<&mut Project>,
     sensitive_input: &mut dyn SensitiveInput,
     output: &mut dyn Write,
 ) -> Result<(), CliError> {
@@ -367,6 +414,13 @@ fn execute_identity(
             name,
             credential_file,
         } => {
+            let credential_file = match credential_file {
+                Some(path) => path,
+                None => default_credential_path(project.as_deref(), &name)?,
+            };
+            if let Some(parent) = credential_file.parent() {
+                config::ensure_vault_dir(parent)?;
+            }
             let password = sensitive_input.read_existing()?;
             let mut application = CliApplication::open_owner(vault, &password)?;
             let prepared = application.prepare_caller_registration(kind.into(), name)?;
@@ -375,6 +429,9 @@ fn execute_identity(
             let issued = application.commit_caller_registration(prepared)?;
             destination.write(&issued)?;
             delivery.finish()?;
+            if let Some(project) = project.as_mut() {
+                project.set_default_caller(issued.caller().id(), &credential_file)?;
+            }
             writeln!(output, "Caller registered")?;
             writeln!(output, "caller_id: {}", issued.caller().id())?;
             writeln!(output, "caller_kind: {}", issued.caller().kind())?;
@@ -425,6 +482,58 @@ fn execute_identity(
     Ok(())
 }
 
+fn resolve_vault(
+    explicit: Option<&Path>,
+    project: Option<&Project>,
+    command: &Command,
+) -> Result<PathBuf, CliError> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
+    }
+    if matches!(command, Command::Init | Command::Uninstall { .. }) {
+        let cwd = env::current_dir().map_err(|_| CliError::OutputUnavailable)?;
+        return Ok(config::default_layout(&cwd).vault().to_path_buf());
+    }
+    project
+        .map(|value| value.vault().to_path_buf())
+        .ok_or(CliError::VaultPathRequired)
+}
+
+fn resolve_profile(
+    explicit: Option<PathBuf>,
+    project: Option<&Project>,
+) -> Result<PathBuf, CliError> {
+    explicit
+        .or_else(|| project.map(|value| value.profile().to_path_buf()))
+        .ok_or(CliError::ProjectDefaultMissing)
+}
+
+fn resolve_credential(
+    explicit: Option<PathBuf>,
+    project: Option<&Project>,
+) -> Result<PathBuf, CliError> {
+    explicit
+        .or_else(|| project.map(|value| value.credential_file().to_path_buf()))
+        .ok_or(CliError::ProjectDefaultMissing)
+}
+
+fn default_credential_path(project: Option<&Project>, name: &str) -> Result<PathBuf, CliError> {
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        || name.is_empty()
+    {
+        return Err(CliError::InvalidCallerName);
+    }
+    let root = match project {
+        Some(project) => project.root().to_path_buf(),
+        None => env::current_dir().map_err(|_| CliError::OutputUnavailable)?,
+    };
+    Ok(root
+        .join(".envvault")
+        .join(format!("{name}.credential.json")))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::VecDeque, env, ffi::OsString, fs, path::PathBuf, str::FromStr as _};
@@ -440,7 +549,7 @@ mod tests {
                 ProfileCommand, SessionCommand,
             },
             error::CliError,
-            password::{PasswordReader, SecretValueReader},
+            password::{ConfirmReader, PasswordReader, SecretValueReader},
         },
         crypto::MasterPassword,
         identity::CallerId,
@@ -489,6 +598,12 @@ mod tests {
                 .pop_front()
                 .map(SecretValue::new)
                 .ok_or(CliError::SecretInputUnavailable)
+        }
+    }
+
+    impl ConfirmReader for FixedSensitiveInput {
+        fn confirm_phrase(&mut self, _expected: &str) -> Result<(), CliError> {
+            Err(CliError::ConfirmationUnavailable)
         }
     }
 
@@ -577,7 +692,7 @@ mod tests {
                     command: IdentityCommand::Register {
                         kind: CallerKindArg::Application,
                         name: "test-app".to_owned(),
-                        credential_file: credential_file.clone(),
+                        credential_file: Some(credential_file.clone()),
                     },
                 },
             ),
@@ -674,7 +789,7 @@ mod tests {
                     command: IdentityCommand::Register {
                         kind: CallerKindArg::AiAgent,
                         name: "session-agent".to_owned(),
-                        credential_file: credential_file.clone(),
+                        credential_file: Some(credential_file.clone()),
                     },
                 },
             ),
@@ -694,7 +809,7 @@ mod tests {
             cli(
                 vault.clone(),
                 Command::Session {
-                    credential_file,
+                    credential_file: Some(credential_file),
                     machine_unlock: false,
                     command: SessionCommand::Whoami,
                 },
@@ -973,7 +1088,7 @@ mod tests {
                     command: IdentityCommand::Register {
                         kind: CallerKindArg::Application,
                         name: "runtime-backend".to_owned(),
-                        credential_file: credential_file.clone(),
+                        credential_file: Some(credential_file.clone()),
                     },
                 },
             ),
@@ -991,7 +1106,7 @@ mod tests {
                 vault.clone(),
                 Command::Profile {
                     command: ProfileCommand::Create {
-                        output: profile_file.clone(),
+                        output: Some(profile_file.clone()),
                         secrets: vec!["ENVVAULT_CLI_RUN_TEST_MODE".to_owned()],
                     },
                 },
@@ -1007,8 +1122,8 @@ mod tests {
             ),
         ];
         let runtime_command = || Command::Run {
-            profile: profile_file.clone(),
-            credential_file: credential_file.clone(),
+            profile: Some(profile_file.clone()),
+            credential_file: Some(credential_file.clone()),
             machine_unlock: false,
             command: child_command.clone(),
         };
@@ -1026,8 +1141,8 @@ mod tests {
                 vault.clone(),
                 Command::Policy {
                     command: PolicyCommand::GrantUse {
-                        caller_id,
-                        profile: profile_file.clone(),
+                        caller_id: Some(caller_id),
+                        profile: Some(profile_file.clone()),
                     },
                 },
             ),

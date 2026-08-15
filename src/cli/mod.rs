@@ -12,6 +12,7 @@ mod error;
 mod example_file;
 mod password;
 mod profile_file;
+mod uninstall;
 
 use std::{ffi::OsString, io, process::ExitCode};
 

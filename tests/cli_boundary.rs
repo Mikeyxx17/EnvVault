@@ -20,6 +20,7 @@ fn help_exposes_no_password_argument() -> Result<(), Box<dyn std::error::Error>>
     assert!(help.contains("verify"));
     assert!(help.contains("--masked-input"));
     assert!(help.contains("run"));
+    assert!(help.contains("uninstall"));
     assert!(!help.contains("--password"));
     assert!(!help.contains("PASSWORD"));
     Ok(())
@@ -69,6 +70,25 @@ fn identity_help_exposes_value_free_credential_rotation() -> Result<(), Box<dyn 
     assert!(!help.contains("<CREDENTIAL>"));
     assert!(!help.contains("--value"));
     assert!(!help.contains("--password"));
+    Ok(())
+}
+
+#[test]
+fn uninstall_without_a_terminal_deletes_nothing() -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new(env!("CARGO_BIN_EXE_envvault"))
+        .args(["uninstall", "--help"])
+        .output()?;
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout)?;
+    assert!(help.contains("--purge-project"));
+    assert!(!help.contains("--password"));
+    assert!(!help.contains("--yes"));
+
+    let refused = Command::new(env!("CARGO_BIN_EXE_envvault"))
+        .arg("uninstall")
+        .output()?;
+    assert!(!refused.status.success());
+    assert!(String::from_utf8(refused.stderr)?.contains("interactive terminal"));
     Ok(())
 }
 

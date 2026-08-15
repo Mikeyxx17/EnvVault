@@ -24,9 +24,13 @@ pub(super) trait SecretValueReader {
     }
 }
 
-pub(super) trait SensitiveInput: PasswordReader + SecretValueReader {}
+pub(super) trait ConfirmReader {
+    fn confirm_phrase(&mut self, expected: &str) -> Result<(), CliError>;
+}
 
-impl<T: PasswordReader + SecretValueReader + ?Sized> SensitiveInput for T {}
+pub(super) trait SensitiveInput: PasswordReader + SecretValueReader + ConfirmReader {}
+
+impl<T: PasswordReader + SecretValueReader + ConfirmReader + ?Sized> SensitiveInput for T {}
 
 pub(super) struct TerminalSensitiveInput {
     masked: bool,
@@ -97,6 +101,26 @@ impl SecretValueReader for TerminalSensitiveInput {
             .read("Expected secret value", None, true)
             .map_err(|_| CliError::SecretInputUnavailable)?;
         Ok(SecretValue::new(value.as_bytes().to_vec()))
+    }
+}
+
+impl ConfirmReader for TerminalSensitiveInput {
+    fn confirm_phrase(&mut self, expected: &str) -> Result<(), CliError> {
+        let term = Term::stderr();
+        if !term.is_term() {
+            return Err(CliError::ConfirmationUnavailable);
+        }
+        term.write_str(&format!("Type `{expected}` to confirm: "))
+            .and_then(|()| term.flush())
+            .map_err(|_| CliError::ConfirmationUnavailable)?;
+        let line = term
+            .read_line()
+            .map_err(|_| CliError::ConfirmationUnavailable)?;
+        if line.trim() == expected {
+            Ok(())
+        } else {
+            Err(CliError::ConfirmationRejected)
+        }
     }
 }
 
