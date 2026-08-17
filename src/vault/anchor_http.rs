@@ -766,7 +766,20 @@ mod tests {
         for entry in std::fs::read_dir(&vaults)? {
             let path = entry?.path().join("state.json");
             if path.exists() {
-                std::fs::remove_file(path)?;
+                let mut last_error = None;
+                for _ in 0..10 {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => {
+                            last_error = None;
+                            break;
+                        }
+                        Err(error) => last_error = Some(error),
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                if let Some(error) = last_error {
+                    return Err(error.into());
+                }
             }
         }
         let error = client.load().err().ok_or("expected rollback")?;

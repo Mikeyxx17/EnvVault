@@ -1152,11 +1152,19 @@ mod tests {
         else {
             return Err("missing state file".into());
         };
-        std::fs::write(&state, b"{")?;
+        overwrite_private(&state, b"{")?;
         assert!(matches!(store.load(VAULT), Err(VaultError::InvalidFormat)));
-        std::fs::write(&state, b"{\"format\":\"envvault-audit-anchor-store\"}")?;
+        overwrite_private(&state, b"{\"format\":\"envvault-audit-anchor-store\"}")?;
         assert!(matches!(store.load(VAULT), Err(VaultError::InvalidFormat)));
         Ok(())
+    }
+
+    fn overwrite_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut file = crate::secure_fs::open_existing_read_write(path)?;
+        file.set_len(0)?;
+        file.write_all(bytes)?;
+        file.sync_all()
     }
 
     #[test]
