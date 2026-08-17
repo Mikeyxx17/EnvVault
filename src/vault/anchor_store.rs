@@ -811,6 +811,7 @@ fn sync_parent_dir(path: &Path) -> Result<(), VaultError> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn sync_parent_dir(_path: &Path) -> Result<(), VaultError> {
     Ok(())
 }
