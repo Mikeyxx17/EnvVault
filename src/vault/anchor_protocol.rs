@@ -10,13 +10,17 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     crypto::{CryptoError, sha256},
     vault::{
         VaultError,
+        anchor_cas::CasDecision,
         audit_anchor::{AnchorCasResult, AnchorSink},
         audit_v2::{parse_anchor, serialize_anchor},
     },
@@ -80,6 +84,21 @@ pub(super) trait AnchorTransport: Send {
     ) -> Result<TransportResponse, TransportFailure>;
 }
 
+/// Persists last-confirmed `(generation, canonical bytes)` off the transport.
+pub(super) trait ConfirmedAnchorPersistence: Send {
+    /// Replace the locally confirmed evidence.
+    fn persist(&mut self, generation: u64, bytes: &[u8]) -> Result<(), VaultError>;
+
+    /// Record value-free evidence that the remote sink rolled back.
+    fn record_rollback(
+        &mut self,
+        expected_generation: u64,
+        expected_bytes: &[u8],
+        observed_generation: Option<u64>,
+        observed_bytes: Option<&[u8]>,
+    ) -> Result<(), VaultError>;
+}
+
 /// ADR 0015 `compare-and-set` request body.
 #[derive(Debug, Serialize, Deserialize)]
 struct CasRequestBody {
@@ -138,6 +157,7 @@ pub(super) struct ProtocolAnchorClient<Transport: AnchorTransport> {
     vault_id: [u8; 16],
     transport: Transport,
     last_confirmed: Option<(u64, Vec<u8>)>,
+    persistence: Option<Box<dyn ConfirmedAnchorPersistence>>,
     max_attempts: u32,
     sleep_before_retry: fn(u32) -> Duration,
 }
@@ -155,40 +175,88 @@ impl<Transport: AnchorTransport> ProtocolAnchorClient<Transport> {
             vault_id,
             transport,
             last_confirmed: None,
+            persistence: None,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             sleep_before_retry,
         }
+    }
+
+    /// Restore last-confirmed evidence loaded from a sidecar.
+    pub(super) fn restore_last_confirmed(&mut self, value: Option<(u64, Vec<u8>)>) {
+        self.last_confirmed = value;
+    }
+
+    /// Persist each newly confirmed generation to an external store.
+    pub(super) fn set_persistence(&mut self, store: Box<dyn ConfirmedAnchorPersistence>) {
+        self.persistence = Some(store);
+    }
+
+    fn remember(&mut self, generation: u64, bytes: Vec<u8>) -> Result<(), VaultError> {
+        if let Some(store) = &mut self.persistence {
+            store.persist(generation, &bytes)?;
+        }
+        self.last_confirmed = Some((generation, bytes));
+        Ok(())
+    }
+
+    fn record_rollback(
+        &mut self,
+        expected_generation: u64,
+        expected_bytes: &[u8],
+        observed_generation: Option<u64>,
+        observed_bytes: Option<&[u8]>,
+    ) -> VaultError {
+        if let Some(store) = &mut self.persistence {
+            let _ignored = store.record_rollback(
+                expected_generation,
+                expected_bytes,
+                observed_generation,
+                observed_bytes,
+            );
+        }
+        VaultError::AuditAnchorDegraded
     }
 }
 
 impl<Transport: AnchorTransport> AnchorSink for ProtocolAnchorClient<Transport> {
     fn load(&mut self) -> Result<Option<Vec<u8>>, VaultError> {
-        let response = self
-            .transport
-            .call(AnchorMethod::Get, &anchor_path(&self.vault_id), None)
-            .map_err(|_| VaultError::AuditAnchorDegraded)?;
-        match response.status {
-            200 => {
-                let body: AnchorBody = serde_json::from_slice(&response.body)
-                    .map_err(|_| VaultError::InvalidFormat)?;
-                let bytes = decode_anchor_field(&body.anchor)?;
-                let observed = parse_anchor(&bytes)?;
-                let canonical = serialize_anchor(&observed)?;
-                if canonical != bytes || observed.vault_id() != self.vault_id {
-                    return Err(VaultError::InvalidFormat);
-                }
-                self.verify_no_rollback(observed.anchor_generation(), &bytes)?;
-                self.last_confirmed = Some((observed.anchor_generation(), bytes.clone()));
-                Ok(Some(bytes))
+        let mut attempt: u32 = 0;
+        loop {
+            match self
+                .transport
+                .call(AnchorMethod::Get, &anchor_path(&self.vault_id), None)
+            {
+                Ok(response) => match response.status {
+                    200 => {
+                        let body: AnchorBody = serde_json::from_slice(&response.body)
+                            .map_err(|_| VaultError::InvalidFormat)?;
+                        let bytes = decode_anchor_field(&body.anchor)?;
+                        let observed = parse_anchor(&bytes)?;
+                        let canonical = serialize_anchor(&observed)?;
+                        if canonical != bytes || observed.vault_id() != self.vault_id {
+                            return Err(VaultError::InvalidFormat);
+                        }
+                        self.verify_no_rollback(observed.anchor_generation(), &bytes)?;
+                        self.remember(observed.anchor_generation(), bytes.clone())?;
+                        return Ok(Some(bytes));
+                    }
+                    404 => {
+                        return if let Some((generation, bytes)) = self.last_confirmed.clone() {
+                            Err(self.record_rollback(generation, &bytes, None, None))
+                        } else {
+                            Ok(None)
+                        };
+                    }
+                    429 | 503 => {}
+                    _ => return Err(VaultError::AuditAnchorDegraded),
+                },
+                Err(TransportFailure::Timeout | TransportFailure::ConnectionFailed) => {}
             }
-            404 => {
-                if self.last_confirmed.is_some() {
-                    Err(VaultError::AuditAnchorDegraded)
-                } else {
-                    Ok(None)
-                }
+            if attempt + 1 >= self.max_attempts {
+                return Err(VaultError::AuditAnchorDegraded);
             }
-            _ => Err(VaultError::AuditAnchorDegraded),
+            (self.sleep_before_retry)(attempt);
+            attempt += 1;
         }
     }
 
@@ -230,16 +298,19 @@ impl<Transport: AnchorTransport> AnchorSink for ProtocolAnchorClient<Transport> 
             };
             match outcome {
                 CasOutcome::Done(result, bytes) => {
-                    self.last_confirmed = Some((proposed.anchor_generation(), bytes));
+                    self.remember(proposed.anchor_generation(), bytes)?;
                     return Ok(result);
                 }
                 CasOutcome::Conflict { generation } => {
-                    if generation.is_some_and(|value| {
-                        self.last_confirmed
-                            .as_ref()
-                            .is_some_and(|(confirmed, _)| value < *confirmed)
-                    }) {
-                        return Err(VaultError::AuditAnchorDegraded);
+                    if let Some((confirmed, confirmed_bytes)) = self.last_confirmed.clone()
+                        && generation.is_some_and(|value| value < confirmed)
+                    {
+                        return Err(self.record_rollback(
+                            confirmed,
+                            &confirmed_bytes,
+                            generation,
+                            None,
+                        ));
                     }
                     return Ok(AnchorCasResult::Conflict);
                 }
@@ -257,7 +328,7 @@ impl<Transport: AnchorTransport> AnchorSink for ProtocolAnchorClient<Transport> 
 
 impl<Transport: AnchorTransport> ProtocolAnchorClient<Transport> {
     fn interpret_cas_response(
-        &self,
+        &mut self,
         response: &TransportResponse,
         proposed_bytes: &[u8],
     ) -> CasOutcome {
@@ -286,12 +357,15 @@ impl<Transport: AnchorTransport> ProtocolAnchorClient<Transport> {
                 if canonical != stored || observed.vault_id() != self.vault_id {
                     return CasOutcome::Fatal(VaultError::InvalidFormat);
                 }
-                if self
-                    .last_confirmed
-                    .as_ref()
-                    .is_some_and(|(confirmed, _)| observed.anchor_generation() < *confirmed)
+                if let Some((confirmed, confirmed_bytes)) = self.last_confirmed.clone()
+                    && observed.anchor_generation() < confirmed
                 {
-                    return CasOutcome::Fatal(VaultError::AuditAnchorDegraded);
+                    return CasOutcome::Fatal(self.record_rollback(
+                        confirmed,
+                        &confirmed_bytes,
+                        Some(observed.anchor_generation()),
+                        Some(&stored),
+                    ));
                 }
                 match body.status.as_str() {
                     status::APPLIED | status::ALREADY_APPLIED if stored == proposed_bytes => {
@@ -349,11 +423,16 @@ impl<Transport: AnchorTransport> ProtocolAnchorClient<Transport> {
         }
     }
 
-    fn verify_no_rollback(&self, generation: u64, bytes: &[u8]) -> Result<(), VaultError> {
-        if let Some((confirmed, confirmed_bytes)) = &self.last_confirmed
-            && (generation < *confirmed || (generation == *confirmed && confirmed_bytes != bytes))
+    fn verify_no_rollback(&mut self, generation: u64, bytes: &[u8]) -> Result<(), VaultError> {
+        if let Some((confirmed, confirmed_bytes)) = self.last_confirmed.clone()
+            && (generation < confirmed || (generation == confirmed && confirmed_bytes != bytes))
         {
-            return Err(VaultError::AuditAnchorDegraded);
+            return Err(self.record_rollback(
+                confirmed,
+                &confirmed_bytes,
+                Some(generation),
+                Some(bytes),
+            ));
         }
         Ok(())
     }
@@ -569,16 +648,42 @@ fn error_body(code: &str) -> Vec<u8> {
     .unwrap_or_default()
 }
 
+/// Encode a GET response body.
+pub(super) fn encode_get_body(bytes: &[u8]) -> Vec<u8> {
+    serde_json::to_vec(&AnchorBody {
+        anchor: STANDARD.encode(bytes),
+    })
+    .unwrap_or_else(|_| error_body("unavailable"))
+}
+
+/// Encode an error body with the given machine-readable code.
+pub(super) fn encode_error_body(code: &str) -> Vec<u8> {
+    error_body(code)
+}
+
+/// Encode a CAS decision as an HTTP status and JSON body.
+pub(super) fn encode_cas_decision(decision: &CasDecision) -> (u16, Vec<u8>) {
+    match decision {
+        CasDecision::Applied(bytes) => applied_body(bytes),
+        CasDecision::AlreadyApplied(bytes) => already_applied_body(bytes),
+        CasDecision::Conflict {
+            generation,
+            current,
+        } => conflict_body(*generation, current.as_deref()),
+        CasDecision::Invalid => (422, error_body("invalid_anchor")),
+    }
+}
+
 /// Build the ADR 0015 GET path for a Vault id.
 fn anchor_path(vault_id: &[u8; 16]) -> String {
-    format!("/v1/vaults/{}/anchor", STANDARD.encode(vault_id))
+    format!("/v1/vaults/{}/anchor", URL_SAFE_NO_PAD.encode(vault_id))
 }
 
 /// Build the ADR 0015 CAS path for a Vault id.
 fn cas_path(vault_id: &[u8; 16]) -> String {
     format!(
         "/v1/vaults/{}/anchor/compare-and-set",
-        STANDARD.encode(vault_id)
+        URL_SAFE_NO_PAD.encode(vault_id)
     )
 }
 
@@ -613,7 +718,10 @@ fn map_crypto_error(error: CryptoError) -> VaultError {
 
 /// Parse the Vault id and suffix out of an ADR 0015 path. Fails on any
 /// deviation, including a suffix that does not match the method.
-fn parse_path_vault(method: AnchorMethod, path: &str) -> Result<[u8; 16], ()> {
+///
+/// Path vault ids use URL-safe unpadded base64 so `/` and `+` cannot split
+/// the path. JSON bodies continue to use standard base64.
+pub(super) fn parse_path_vault(method: AnchorMethod, path: &str) -> Result<[u8; 16], ()> {
     const PREFIX: &str = "/v1/vaults/";
     let rest = path.strip_prefix(PREFIX).ok_or(())?;
     let (encoded, suffix) = rest.split_once('/').ok_or(())?;
@@ -624,7 +732,7 @@ fn parse_path_vault(method: AnchorMethod, path: &str) -> Result<[u8; 16], ()> {
     if suffix != expected_suffix {
         return Err(());
     }
-    let bytes = STANDARD.decode(encoded).map_err(|_| ())?;
+    let bytes = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| ())?;
     if bytes.len() != 16 {
         return Err(());
     }

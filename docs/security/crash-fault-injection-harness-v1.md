@@ -1,6 +1,6 @@
 # Crash / Power-loss Fault-injection Harness V1
 
-状态：Harness 与合成场景已实现并在本会话冒烟验证（6 个注入点全部通过）；真实 EnvVault 场景模板已就绪。真实 Vault 的强制终止与断电验证必须在 Windows VM、Linux VM 和真实磁盘的完整权限环境执行——本 harness 只提供可复现的执行与留证框架，不构成任何断电安全声明。
+状态：Harness、合成轮换场景、远程锚点文件场景，以及真实 Vault 轮换进程击杀场景已实现。本机 Linux 已冒烟：合成 6 点、远程锚点 4 点、真实轮换 4 点（`kill -9` 后全部 `recovered`）。Windows VM、真实磁盘和断电验证仍未做——本 harness 不构成任何断电安全声明。
 
 ## 定位
 
@@ -66,7 +66,40 @@ pwsh scripts\fault-injection.ps1 ... -PoweroffCommand 'VBoxManage controlvm envv
 | vault-committed | Vault 内容变化 | Vault commit 前后 |
 | anchor-confirmed | anchor sidecar 更新 | anchor CAS 前后 / confirmed 清理 |
 
-EnvVault 模板的 checkpoint 由 sidecar 文件名/内容观察驱动（`<vault>.audit-rotation-recovery.json`、新出现的 segment 文件、Vault 长度变化、`<vault>.audit-anchor-v2.json`），不读取任何 Secret Value。
+EnvVault 模板的 checkpoint 由 sidecar 文件名/内容观察驱动（`<vault>.audit-rotation-recovery.json`、新出现的 segment 文件、Vault 长度变化、`<vault>.audit-anchor-v2.json` 或 `<vault>.audit-anchor-confirmed.json`），不读取任何 Secret Value。
+
+远程锚点合成场景（无 TTY、无凭证）覆盖 CAS 文件不变量：
+
+```bash
+bash scripts/fault-injection.sh \
+  --scenario scripts/fault-injection-scenarios/remote-anchor/scenario.sh \
+  --recovery scripts/fault-injection-scenarios/remote-anchor/recovery.sh \
+  --work-root /tmp/envvault-fault-remote \
+  --inject-at before-cas,store-written,confirmed-written,store-rolled-back
+```
+
+| 注入点 | 可接受 verdict |
+|---|---|
+| before-cas | `fail_closed` |
+| store-written | `recovered` |
+| confirmed-written | `recovered` |
+| store-rolled-back | `fail_closed`（必须有 rollback 证据） |
+
+`data_loss` 表示 last-confirmed 已存在但 store 对不上且没有 rollback 证据，必须调查。
+
+真实 Vault 轮换（无 TTY，一次性测试库，`--features fault-injection`）：
+
+```bash
+cargo build --features fault-injection --bin envvault-fault-target
+export ENVVAULT_FAULT_TARGET=$PWD/target/debug/envvault-fault-target
+bash scripts/fault-injection.sh \
+  --scenario scripts/fault-injection-scenarios/envvault-rotation/scenario.sh \
+  --recovery scripts/fault-injection-scenarios/envvault-rotation/recovery.sh \
+  --work-root /tmp/envvault-fault-rotation \
+  --inject-at prepared-manifest,sealed-segment,vault-committed,anchor-confirmed
+```
+
+固定测试密码只存在于该二进制内部，不能从环境变量或参数传入，也不能用来保护真实 Secret。`ENVVAULT_FAULT_PAUSE_MS`（默认 400）只拉长轮换状态机窗口，便于击杀命中；它不是生产配置。
 
 ## 边界与必须补做的验收
 

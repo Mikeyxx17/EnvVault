@@ -133,12 +133,50 @@ pub(super) enum KeystoreCommand {
     Disable,
 }
 
-#[derive(Debug, Clone, Copy, Subcommand)]
+#[derive(Debug, Subcommand)]
 pub(super) enum AuditCommand {
     /// List value-free Audit events after exact Owner authorization.
     List,
     /// Explicitly migrate a legacy Vault Audit chain to the V2 sidecar backend.
     MigrateV2,
+    /// Run a loopback ADR 0015 CAS service in an independent data directory.
+    ServeAnchor {
+        /// Private directory for CAS state. Must not be the Vault directory.
+        #[arg(long, value_name = "PATH")]
+        data_dir: PathBuf,
+        /// Loopback listen address. Defaults to `127.0.0.1:7432`.
+        #[arg(long, value_name = "ADDR")]
+        listen: Option<String>,
+        /// Bearer token file. Created if missing. Defaults to `<data-dir>/token.json`.
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<PathBuf>,
+        /// PEM certificate chain. Required unless `--allow-plaintext`.
+        #[arg(long, value_name = "PATH")]
+        tls_cert: Option<PathBuf>,
+        /// PEM private key. Required unless `--allow-plaintext`.
+        #[arg(long, value_name = "PATH")]
+        tls_key: Option<PathBuf>,
+        /// Listen without TLS. Loopback tests only; this is not a production mode.
+        #[arg(long)]
+        allow_plaintext: bool,
+    },
+    /// Point this Vault at a mandatory loopback CAS after Owner authentication.
+    ConfigureAnchor {
+        /// Loopback endpoint, preferably `https://127.0.0.1:7432`.
+        #[arg(long, value_name = "URL")]
+        endpoint: String,
+        /// Existing Bearer token file issued by `audit serve-anchor`.
+        #[arg(long, value_name = "PATH")]
+        token_file: PathBuf,
+        /// PEM trust anchor used to verify `https://` endpoints.
+        #[arg(long, value_name = "PATH")]
+        tls_ca: Option<PathBuf>,
+        /// Allow an `http://` loopback endpoint. Not a production mode.
+        #[arg(long)]
+        allow_plaintext: bool,
+    },
+    /// Print value-free remote-anchor configuration and last-confirmed generation.
+    AnchorStatus,
 }
 
 #[derive(Debug, Subcommand)]
@@ -219,7 +257,7 @@ impl From<CallerKindArg> for CallerKind {
 mod tests {
     use clap::Parser as _;
 
-    use super::{Cli, Command, IdentityCommand, SessionCommand};
+    use super::{AuditCommand, Cli, Command, IdentityCommand, SessionCommand};
 
     #[test]
     fn parses_identity_registration_without_secret_arguments() {
@@ -342,6 +380,43 @@ mod tests {
             Ok(Command::Run {
                 machine_unlock: true,
                 ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_audit_anchor_service_commands() {
+        let serve = Cli::try_parse_from([
+            "envvault",
+            "audit",
+            "serve-anchor",
+            "--data-dir",
+            "/tmp/anchor-data",
+            "--listen",
+            "127.0.0.1:0",
+        ]);
+        assert!(matches!(
+            serve.map(|value| value.command),
+            Ok(Command::Audit {
+                command: AuditCommand::ServeAnchor { .. }
+            })
+        ));
+
+        let configure = Cli::try_parse_from([
+            "envvault",
+            "--vault",
+            "test.vault",
+            "audit",
+            "configure-anchor",
+            "--endpoint",
+            "http://127.0.0.1:7432",
+            "--token-file",
+            "token.json",
+        ]);
+        assert!(matches!(
+            configure.map(|value| value.command),
+            Ok(Command::Audit {
+                command: AuditCommand::ConfigureAnchor { .. }
             })
         ));
     }

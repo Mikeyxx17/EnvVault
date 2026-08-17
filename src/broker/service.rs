@@ -199,7 +199,8 @@ impl<A: AuditSink> SecretBroker<A> {
         let identities = load_identities(&vault)?;
         validate_audit(&vault)?;
         let audit_v2 = if AuditRuntimeV2::exists(vault.path())? {
-            let mut runtime = AuditRuntimeV2::local_mirror();
+            let mut runtime = AuditRuntimeV2::for_vault(vault.path(), vault.vault_id())
+                .map_err(|_| BrokerError::AuditUnavailable)?;
             runtime
                 .read_all(vault.path(), vault.master_key())
                 .map_err(|_| BrokerError::AuditUnavailable)?;

@@ -82,4 +82,4 @@ Event AAD 的 exact byte layout 为：
 4. 中断重试先验证源摘要和已复制 V2 前缀，只继续缺失事件；每个 segment、descriptor、anchor 和事件数量均需认证验证。
 5. 全量逐项相同后删除迁移标记并切换；主 Vault 内 V1 链保留为冻结历史副本，后续不再双写。
 
-自动降级 V2→V1 被禁止。Phase 7E～7J 已实现 recovery manifest、segment store、Descriptor V3 key lifecycle、authenticated 本地轮换、Broker/CLI 接入、本地 anchor CAS、degraded 原语和显式迁移；真正外部单调 sink 与断电级一致性测试仍未完成。
+自动降级 V2→V1 被禁止。Phase 7E～7J 已实现 recovery manifest、segment store、Descriptor V3 key lifecycle、authenticated 本地轮换、Broker/CLI 接入、本地 anchor CAS、degraded 原语和显式迁移；loopback 明文参考 CAS 与 last-confirmed 持久化已接入。真正远程/硬件单调 sink 与断电级一致性测试仍未完成。

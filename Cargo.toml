@@ -9,6 +9,7 @@ publish = false
 [features]
 default = []
 fuzzing = []
+fault-injection = []
 
 [dependencies]
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc"] }
@@ -18,6 +19,8 @@ chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["
 clap = { version = "4.6.6", features = ["derive"] }
 dialoguer = { version = "0.12.0", default-features = false, features = ["password"] }
 getrandom = "0.4.3"
+rustls = { version = "0.23.31", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-pemfile = "2.2.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0"
 sha2 = { version = "0.11.0", default-features = false }
@@ -39,6 +42,7 @@ keyring-core = "1.0.0"
 
 [dev-dependencies]
 proptest = "1.7"
+rcgen = { version = "0.13.2", default-features = false, features = ["ring", "pem"] }
 tempfile = "3"
 
 [lints.rust]
@@ -51,6 +55,11 @@ pedantic = { level = "warn", priority = -1 }
 expect_used = "deny"
 panic = "deny"
 unwrap_used = "deny"
+
+[[bin]]
+name = "envvault-fault-target"
+path = "src/bin/envvault-fault-target.rs"
+required-features = ["fault-injection"]
 
 [profile.release]
 codegen-units = 1

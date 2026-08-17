@@ -18,20 +18,24 @@
 
 ### 1.1 外部单调 Audit Anchor
 
-- 部署独立于 Vault 文件回滚域的 CAS 服务、WORM 存储或硬件单调状态。
-- 验证 generation、sequence、predecessor digest 和 canonical bytes。
-- 覆盖响应丢失、重复请求、冲突、服务不可用、服务端回滚和恢复。
-- mandatory 模式异常时必须保持 degraded/fail-closed，不能继续发放 Secret。
+工程前置件已落地：loopback 参考 CAS（默认 rustls，明文仅显式测试开关）、HTTP 客户端、持久化 last-confirmed、mandatory CLI 接入、按 Vault 绑定 token、value-free 访问审计、回滚证据 sidecar，以及针对真实 HTTP/HTTPS 服务的跨 Vault / 回滚 / 访问日志自动化测试。仍缺：
 
-完成证据：部署配置、协议测试、故障记录和恢复记录全部可复现。
+- 部署独立于本机回环域的 CAS 服务、WORM 存储或硬件单调状态。
+- 在真实 HTTPS 或硬件路径上验证 generation、sequence、predecessor digest 和 canonical bytes。
+- 覆盖响应丢失、重复请求、冲突、服务不可用、服务端回滚和恢复的部署级记录。
+- mandatory 模式在真实部署异常时必须保持 degraded/fail-closed，不能继续发放 Secret。
+
+完成证据：部署配置、协议测试、故障记录和恢复记录全部可复现。当前参考服务不能计入该项完成。
 
 ### 1.2 崩溃与断电耐久性
 
-- 在 Windows VM、Linux VM 和至少一种真实磁盘上执行 rotation/recovery 故障矩阵。
-- 在 manifest、segment、Vault commit、anchor CAS 和目录同步边界强制终止进程或断电。
-- 重启后只能安全恢复或失败关闭，不得丢失已经发放 Secret 对应的 Audit。
+工程前置件已落地：合成轮换场景、远程锚点文件场景、真实 Vault 轮换进程击杀（feature `fault-injection`）、Unix 父目录 fsync，以及损坏 CAS store 失败关闭测试。本机 Linux `kill -9` 已覆盖 prepared-manifest / sealed-segment / vault-committed / anchor-confirmed。仍缺：
 
-完成证据：每个注入点的前置状态、终止方式、磁盘状态和恢复结果均留档。
+- 在 Windows VM、Linux VM 和至少一种真实磁盘上执行完整 rotation/recovery 故障矩阵。
+- 在目录同步边界断电，以及交互式 `audit migrate-v2` 的真实 TTY 击杀。
+- 重启后不得丢失已经发放 Secret 对应的 Audit（当前击杀场景不发放 Secret）。
+
+完成证据：每个注入点的前置状态、终止方式、磁盘状态和恢复结果均留档。本机 `kill -9` 通过不能计入断电完成。
 
 ### 1.3 三平台真实运行矩阵
 

@@ -58,6 +58,23 @@ fn session_help_accepts_only_identity_evidence_and_unlock_mode()
 }
 
 #[test]
+fn audit_help_exposes_loopback_anchor_commands_without_token_flags()
+-> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new(env!("CARGO_BIN_EXE_envvault"))
+        .args(["audit", "--help"])
+        .output()?;
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout)?;
+    assert!(help.contains("serve-anchor"));
+    assert!(help.contains("configure-anchor"));
+    assert!(help.contains("anchor-status"));
+    assert!(!help.contains("--password"));
+    assert!(!help.contains("--token "));
+    assert!(!help.contains("SECRET"));
+    Ok(())
+}
+
+#[test]
 fn identity_help_exposes_value_free_credential_rotation() -> Result<(), Box<dyn std::error::Error>>
 {
     let output = Command::new(env!("CARGO_BIN_EXE_envvault"))

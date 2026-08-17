@@ -35,9 +35,11 @@ function Write-Checkpoint {
 
 $manifestName = "$vault.audit-rotation-recovery.json"
 $anchorName = "$vault.audit-anchor-v2.json"
+$confirmedName = "$vault.audit-anchor-confirmed.json"
 $known = @{
     $manifestName = $true
     $anchorName   = $true
+    $confirmedName = $true
     "$vault.audit-descriptor-v3.json" = $true
 }
 $vaultLengthBefore = if (Test-Path -LiteralPath $vault) {
@@ -47,7 +49,7 @@ $vaultLengthBefore = if (Test-Path -LiteralPath $vault) {
 }
 
 $watcher = Start-Job -ScriptBlock {
-    param($dir, $knownNames, $manifestName, $anchorName, $vaultPath, $vaultLengthBefore)
+    param($dir, $knownNames, $manifestName, $anchorName, $confirmedName, $vaultPath, $vaultLengthBefore)
     $checkpoints = $env:FAULT_CHECKPOINTS
     $reportedManifest = $false
     $reportedSealed = $false
@@ -78,7 +80,9 @@ $watcher = Start-Job -ScriptBlock {
             }
         }
         if (-not $reportedAnchor) {
-            $anchor = $entries | Where-Object { $_.Name -eq $anchorName }
+            $anchor = $entries | Where-Object {
+                $_.Name -eq $anchorName -or $_.Name -eq $confirmedName
+            }
             if ($anchor) {
                 New-Item -ItemType File -Force `
                     -Path (Join-Path $checkpoints 'anchor-confirmed') | Out-Null
@@ -87,7 +91,7 @@ $watcher = Start-Job -ScriptBlock {
         }
         Start-Sleep -Milliseconds 100
     }
-} -ArgumentList $vaultDir, $known, $manifestName, $anchorName, $vault, $vaultLengthBefore
+} -ArgumentList $vaultDir, $known, $manifestName, $anchorName, $confirmedName, $vault, $vaultLengthBefore
 
 try {
     & envvault --vault $vault audit migrate-v2

@@ -22,9 +22,21 @@
 - `fault-injection.ps1`：Windows 故障注入 harness（`taskkill /T /F` 击杀进程树），把 `docs/security/audit-rotation-fault-matrix.md` 的注入点变成可复现的"运行 → 精确击杀 → 重启验证 → 留证"流程。
 - `fault-injection.sh`：`fault-injection.ps1` 的 Linux/macOS 移植，使用 `setsid` + `kill -9` 击杀进程组。产出与 Windows 版同构的 `envvault-fault-injection-run-v1` 记录到 `fault-injection-runs/<timestamp>/`。
 - `fault-injection-scenarios/synthetic/`：合成冒烟场景（无凭证、无 TTY），用于验证 harness 本身；`.ps1` 与 `.sh` 同构，覆盖六个注入点。
+- `fault-injection-scenarios/remote-anchor/`：合成远程锚点文件场景（无凭证、无 TTY），覆盖 CAS store、last-confirmed 和 rollback 证据四个注入点。
+- `fault-injection-scenarios/envvault-rotation/`：真实 Vault Audit 轮换进程击杀（`.ps1` 与 `.sh`）。需要 `cargo build --features fault-injection --bin envvault-fault-target`，不需要 TTY，不得指向存有真实 Secret 的 Vault。
 - `fault-injection-scenarios/envvault-migrate-v2/`：真实 EnvVault `audit migrate-v2` 场景模板（`.ps1` 与 `.sh`）。必须用 harness 的 `--interactive` 运行以通过 Master Password TTY 提示，且必须使用一次性测试 Vault（绝不能用保存真实 Secret 的 Vault）。
 
-运行合成冒烟（Linux/macOS）：
+运行远程锚点文件冒烟（Linux/macOS）：
+
+```bash
+bash scripts/fault-injection.sh \
+  --scenario scripts/fault-injection-scenarios/remote-anchor/scenario.sh \
+  --recovery scripts/fault-injection-scenarios/remote-anchor/recovery.sh \
+  --work-root /tmp/envvault-fault-remote \
+  --inject-at before-cas,store-written,confirmed-written,store-rolled-back
+```
+
+运行合成轮换冒烟（Linux/macOS）：
 
 ```bash
 bash scripts/fault-injection.sh \

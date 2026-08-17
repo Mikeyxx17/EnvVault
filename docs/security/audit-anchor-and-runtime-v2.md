@@ -13,7 +13,15 @@
 
 当前 `LocalMirrorAnchorSink` 写 `<vault>.audit-anchor-v2.json`，使用私有文件、sidecar lock 和原子替换。它能验证协议、发现误损坏和本地不一致，但与 Vault 位于同一回滚域，不能声称抵抗同盘整体回滚。
 
-mandatory sink 的读/CAS 失败会保留 recovery manifest。后续打开或 Audit 写入识别该 manifest，返回 degraded 错误，不通过本地镜像静默降级。当前 CLI 默认使用 `local_mirror`，尚无用户可配置的远程 mandatory sink。
+mandatory sink 的读/CAS 失败会保留 recovery manifest。后续打开或 Audit 写入识别该 manifest，返回 degraded 错误，不通过本地镜像静默降级。CLI 默认仍使用 `local_mirror`。Owner 可显式配置独立数据目录上的 loopback 参考 CAS：
+
+```text
+envvault audit serve-anchor --data-dir <DIR>
+envvault --vault <PATH> audit configure-anchor --endpoint http://127.0.0.1:7432 --token-file <TOKEN>
+envvault --vault <PATH> audit anchor-status
+```
+
+该服务只接受回环地址。默认用 rustls（TLS 1.2+，优先 1.3）并校验 SAN `DNS:localhost`；明文必须显式 `--allow-plaintext`。Token 在首次成功访问时绑定到那个 `vault_id`，之后拒绝跨 Vault。每次请求写入 `<data-dir>/access.jsonl`（不含 token）。客户端若发现 generation 回退或 digest 不一致，会写入 `<vault>.audit-anchor-rollback.json`，`anchor-status` 只显示 generation 证据。它能验证协议、TLS 握手、幂等、冲突、跨 Vault 拒绝和 last-confirmed 回滚检测，但不能抵抗同机整体回滚，也不能代替远程 WORM 或硬件锚点。自签名证书只用于本机参考部署。
 
 ## Broker 与活动段
 
@@ -41,8 +49,8 @@ CLI `audit list` 经过独立 `read_audit` 授权，输出时间、Caller、认�
 
 ## 未完成边界
 
-- 远程 append-only/WORM、平台单调计数器或硬件 AnchorSink；
-- remote sink timeout/replay/service rollback 的端到端测试；
+- 远程 append-only/WORM、平台单调计数器或硬件 AnchorSink（当前只有 loopback 明文参考服务）；
+- 真实 HTTPS 部署上的 timeout/replay/service rollback 验收；
 - 父目录 handle flush、强制终止和真实断电证明；
 - retention/export/备份验证和显式清理命令；
 - 多进程压力、恶意同账户竞态和独立安全审计。

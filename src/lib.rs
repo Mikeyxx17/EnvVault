@@ -24,6 +24,8 @@ pub mod config;
 pub mod crypto;
 pub mod dotenv;
 pub mod error;
+#[cfg(feature = "fault-injection")]
+pub mod fault_injection;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
 pub mod identity;

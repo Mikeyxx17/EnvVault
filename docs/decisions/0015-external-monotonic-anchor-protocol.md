@@ -1,6 +1,6 @@
 # ADR 0015: External Monotonic Anchor Wire Protocol
 
-状态：Proposed（草稿，2026-08-13）。本 ADR 冻结远程 AnchorSink 的 wire protocol 与故障语义，供参考实现、test double 与未来真实部署共用。真实部署验收完成前，不声明完整回滚保护。
+状态：Proposed（2026-08-16 更新）。本 ADR 冻结远程 AnchorSink 的 wire protocol 与故障语义。仓库已有 loopback 参考服务（默认 rustls，明文仅显式测试开关）、HTTP 客户端、持久化 last-confirmed 和 mandatory CLI 接入。真实远程 WORM/硬件部署与故障矩阵验收完成前，不声明完整回滚保护。
 
 ## 背景
 
@@ -55,7 +55,7 @@ POST /v1/vaults/{vault_id_b64}/anchor/compare-and-set
   503 {"error": "unavailable"}        # 可重试
 ```
 
-路径中的 `vault_id_b64` 必须等于 anchor 内 `vault_id`，否则服务端返回 `422`。
+路径中的 `vault_id_b64` 必须等于 anchor 内 `vault_id`，否则服务端返回 `422`。路径参数使用 URL-safe 无填充 Base64，避免标准 Base64 的 `/` 和 `+` 切断路径；JSON 字段仍使用标准 Base64。
 
 ### 认证与授权
 
@@ -95,7 +95,7 @@ POST /v1/vaults/{vault_id_b64}/anchor/compare-and-set
 - `AnchorSink` trait 无需修改；远程实现作为新 struct 落入 `vault` 模块（trait 暂不公开，避免过早承诺公共 API）。
 - 新增客户端状态：last-confirmed `(generation, digest)`、重试状态与 request_id 生成，全部 value-free。
 - Vault 文件格式、Descriptor V3、segment 格式零改动。
-- 本地镜像仍是默认 sink；远程 mandatory sink 的 CLI/config 接入不属本 ADR 范围。
+- 本地镜像仍是默认 sink。Owner 可通过 `audit configure-anchor` 把单个 Vault 指到独立数据目录上的 loopback 参考服务。默认要求 `https://` 与 PEM 信任锚；`--allow-plaintext` 只用于回环测试。该服务仍不可当作远程 WORM。参考服务会把 token 绑定到首次访问的 `vault_id`（拒绝跨 Vault）、写 value-free 访问审计，并在检测到服务端回滚时留下 generation/digest 证据。证书必须包含 SAN `DNS:localhost`。
 
 ## 安全边界
 

@@ -3,7 +3,11 @@
 //! The vault stores independent secret records and does not treat an entire
 //! `.env` file as one authorization unit.
 
+mod anchor_cas;
+mod anchor_http;
 mod anchor_protocol;
+mod anchor_store;
+mod anchor_tls;
 mod audit_anchor;
 mod audit_descriptor;
 mod audit_recovery;
@@ -19,6 +23,10 @@ mod payload;
 
 pub use error::VaultError;
 
+pub(crate) use anchor_http::{AnchorHttpServer, default_listen_addr};
+#[cfg(test)]
+pub(crate) use anchor_store::issue_anchor_token_file;
+pub(crate) use anchor_store::{configure_anchor_client, load_anchor_status};
 pub(crate) use audit_runtime::AuditRuntimeV2;
 pub(crate) use file::FileVault;
 

@@ -32,11 +32,12 @@ mark() { : >"$checkpoints/$1"; }
 vault_base=$(basename "$vault")
 manifest_name="$vault_base.audit-rotation-recovery.json"
 anchor_name="$vault_base.audit-anchor-v2.json"
+confirmed_name="$vault_base.audit-anchor-confirmed.json"
 descriptor_name="$vault_base.audit-descriptor-v3.json"
 
 known() {
     case "$1" in
-        "$vault_base"|"$manifest_name"|"$anchor_name"|"$descriptor_name") return 0 ;;
+        "$vault_base"|"$manifest_name"|"$anchor_name"|"$confirmed_name"|"$descriptor_name") return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -73,7 +74,7 @@ vault_length_before=0
                 reported_vault=1
             fi
         fi
-        if [ "$reported_anchor" -eq 0 ] && [ -f "$vault_dir/$anchor_name" ]; then
+        if [ "$reported_anchor" -eq 0 ] && { [ -f "$vault_dir/$anchor_name" ] || [ -f "$vault_dir/$confirmed_name" ]; }; then
             mark anchor-confirmed
             reported_anchor=1
         fi

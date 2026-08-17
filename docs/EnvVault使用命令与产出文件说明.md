@@ -7,7 +7,7 @@
 
 ## 1. 这是什么
 
-EnvVault 是命令行程序，不是后台服务。每次执行 `envvault`，进程启动、打开加密 Vault、按「调用者 × Secret × 操作」授权、写审计，然后退出。`run` 在授权通过后拉起子程序；子程序结束后 envvault 也结束。
+EnvVault 主要是命令行程序，不是必须常驻的后台服务。每次执行 `envvault`，进程启动、打开加密 Vault、按「调用者 × Secret × 操作」授权、写审计，然后退出。`run` 在授权通过后拉起子程序；子程序结束后 envvault 也结束。可选的 `audit serve-anchor` 会在独立数据目录启动一个只监听回环地址的 CAS 进程（默认 rustls），供 Audit 轮换确认使用；默认不启动，也不能当成远程保险柜。
 
 可以把它想成 `git` 或 `cargo`：磁盘上有一份程序文件，每条命令调用一次。
 
@@ -17,7 +17,7 @@ EnvVault 是命令行程序，不是后台服务。每次执行 `envvault`，进
 | 程序如何拿到 | 自己读 `.env` | 由 `envvault run` 注入环境变量 |
 | 谁能用哪条 | 拿到文件就能用全部 | 必须注册身份并精确授予 `use` |
 | 每次是否写路径 | 要写 `--vault` / `--profile` / `--credential-file` | 有 `envvault.json` 后可用短命令 |
-| 要不要常驻服务 | 不用 | 也不用 |
+| 要不要常驻服务 | 不用 | 默认不用；可选 `audit serve-anchor` |
 
 Release 二进制一般在仓库的 `target/release/envvault`，也可放到 `~/.local/bin/envvault`。若提示 `command not found`，检查 `PATH` 是否包含安装目录。
 
@@ -157,13 +157,30 @@ envvault run --machine-unlock -- ./my-app
 ```bash
 envvault audit list
 envvault audit migrate-v2
+envvault audit serve-anchor --data-dir /var/lib/envvault-anchor \
+  --tls-cert /var/lib/envvault-anchor/cert.pem \
+  --tls-key /var/lib/envvault-anchor/key.pem
+envvault audit configure-anchor --endpoint https://127.0.0.1:7432 \
+  --token-file /var/lib/envvault-anchor/token.json \
+  --tls-ca /var/lib/envvault-anchor/cert.pem
+envvault audit anchor-status
 envvault keystore enable
 envvault keystore status
 envvault session whoami
 envvault session --machine-unlock whoami
 ```
 
-`audit list` 输出不含 Secret 值的事件。新 Vault 默认 Audit V2。`keystore` 走操作系统钥匙库，EnvVault 自己不常驻。
+`audit list` 输出不含 Secret 值的事件。新 Vault 默认 Audit V2。`keystore` 走操作系统钥匙库，EnvVault 自己不常驻。`serve-anchor` 在独立目录启动只监听回环地址的 CAS，默认要求 TLS 证书和私钥，证书 SAN 必须包含 `DNS:localhost`。可用 openssl 自签仅供本机参考：
+
+```bash
+openssl req -x509 -newkey rsa:2048 -sha256 -days 30 -nodes \
+  -keyout /var/lib/envvault-anchor/key.pem \
+  -out /var/lib/envvault-anchor/cert.pem \
+  -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+```
+
+`--allow-plaintext` 只用于测试。Token 第一次成功访问后只绑定那个 Vault，服务端写 `access.jsonl`（不含 token）。`configure-anchor` 需要 Owner 密码；`https://` 必须带 `--tls-ca`，`http://` 必须带 `--allow-plaintext`。之后 Audit 轮换按 mandatory 失败关闭。`anchor-status` 不需要密码，只打印 mode、endpoint、token 路径、tls 状态、last-confirmed generation/digest 和 rollback_evidence。这仍不是远程 WORM 或硬件锚点。
 
 ### 4.8 `uninstall`
 
@@ -208,12 +225,15 @@ sidecar 文件名 = Vault 路径字符串直接拼接后缀。
 | `*.vault.audit-active-v2-<段号>.json` | 写审计 | 当前活动段 |
 | `envvault-audit-segment-<段号>.json` | 段写满轮换 | 已封存历史段 |
 | `*.vault.audit-anchor-v2.json` | 本地锚点确认 | 同盘 CAS，不抗整盘回滚 |
+| `*.vault.audit-anchor-client.json` | `audit configure-anchor` | 指向 loopback CAS 的 endpoint 和 token 路径 |
+| `*.vault.audit-anchor-confirmed.json` | 远程 CAS 确认后 | last-confirmed generation 与 digest |
+| `*.vault.audit-anchor-rollback.json` | 检测到服务端回滚 | 期望 vs 观察到的 generation/digest |
 | `*.vault.audit-rotation-recovery.json` | 轮换中途 | 正常完成后应消失 |
 | `*.vault.audit-migration-v2.json` | `migrate-v2` 中途 | 完成后应删除 |
 | `*.vault.machine-unlock-v1.json` | `keystore enable` | 系统钥匙库绑定，不含 Master Key 明文 |
 | `*.vault.credential-delivery.json` | register/rotate 崩溃 | 交付恢复；成功后删除 |
 
-备份：Vault + descriptor + 所有 segment + 若存在的 anchor。credential 当 Secret 保管。`.lock`、profile、`envvault.json` 可重建。
+备份：Vault + descriptor + 所有 segment + 若存在的本地/确认锚点 sidecar。独立 CAS 数据目录和 token 文件要单独备份，且不要和 Vault 放在同一回滚域里才有意义。credential 当 Secret 保管。`.lock`、profile、`envvault.json` 可重建。
 
 ## 7. 常见报错
 
@@ -236,7 +256,7 @@ sidecar 文件名 = Vault 路径字符串直接拼接后缀。
 - `import` 不会安全删除源 `.env`。
 - `remove` / `uninstall --purge-project` 不会擦除磁盘历史块。
 - machine unlock 不能防同一操作系统用户下的其它进程。
-- 本地镜像 Audit 不能防整盘回滚。
+- 本地镜像 Audit 不能防整盘回滚。loopback 参考 CAS（即使开了 rustls）也不能防同机整体回滚，更不是远程 WORM 或硬件锚点。
 - 没有 SDK：其它语言不要自己解密 Vault。
 - `envvault.json` 不能代替 credential；丢了 json 只是丢了默认路径。
 - `uninstall` 不删除源码仓库，也不扫描整盘上的其它 Vault。

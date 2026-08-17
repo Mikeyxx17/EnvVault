@@ -11,11 +11,13 @@
 - Cargo 来源只允许 crates.io registry，不允许未知 registry 或 Git dependency；
 - wildcard dependency 被拒绝；项目为 `publish = false`，private workspace license 不参与第三方 license 判定。
 
-允许的第三方许可证为 Apache-2.0、BSD-3-Clause、MIT 和 Unicode-3.0。新增许可证必须显式评审并修改 `deny.toml`。
+允许的第三方许可证为 Apache-2.0、BSD-3-Clause、ISC、MIT 和 Unicode-3.0。新增许可证必须显式评审并修改 `deny.toml`。
+
+ISC 于 2026-08-16 加入，因为 `rustls` 的 `ring` 后端与 `rustls-webpki`/`untrusted` 使用 ISC（MIT 风格）。`ring` 声明为 Apache-2.0 AND ISC。该评审只覆盖许可证文本兼容性，不构成对 ring 汇编实现的独立密码学验收。
 
 ## 当前结果
 
-- `cargo audit` 更新 RustSec 数据库后扫描 108 个锁定依赖：未报告 vulnerability；
+- `cargo audit` 更新 RustSec 数据库后扫描锁定依赖：加入 rustls/ring 参考 HTTPS CAS 后必须重跑；自动化通过仍不构成供应链验收。
 - advisories、licenses 和 sources：0 error；
 - bans：0 error、6 个 duplicate-version warning；
 - 重复版本来自密码学版本代际（包括 Argon2 的 `digest 0.10` 与 SHA-256 的 `digest 0.11`）、Windows permissions 的旧 `bitflags`，以及 dev-only `proptest` 依赖链。当前只警告，不使用无依据 `skip` 隐藏；升级上游依赖时继续收敛。

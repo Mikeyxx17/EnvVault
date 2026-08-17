@@ -21,6 +21,11 @@ envvault --vault <PATH> profile create --output <PATH> <SECRET>...
 envvault --vault <PATH> policy grant-use --caller-id <CALLER_ID> --profile <PATH>
 envvault --vault <PATH> audit list
 envvault --vault <PATH> audit migrate-v2
+envvault audit serve-anchor --data-dir <DIR> --tls-cert <CERT.pem> --tls-key <KEY.pem>
+envvault audit serve-anchor --data-dir <DIR> --allow-plaintext
+envvault --vault <PATH> audit configure-anchor --endpoint https://127.0.0.1:7432 --token-file <PATH> --tls-ca <CERT.pem>
+envvault --vault <PATH> audit configure-anchor --endpoint http://127.0.0.1:7432 --token-file <PATH> --allow-plaintext
+envvault --vault <PATH> audit anchor-status
 envvault --vault <PATH> run --profile <PATH> --credential-file <PATH> -- <PROGRAM> [ARG]...
 ```
 
@@ -75,7 +80,7 @@ Credential 文件格式：
 - `list` 仅输出获得逐 Secret `list` Allow 的名称，不输出 ID、Value 或密文。
 - `import` 严格解析并把每个 key/value 作为独立 Secret 全有或全无地提交；不修改或删除源文件。
 - `example` 只生成获得 `list` Allow 的合法 dotenv key，输出 `KEY=` 且拒绝覆盖已有文件。
-- 新 Vault 的控制面/Secret 决策写入 Audit V2；`audit list` 需要独立 `read_audit` 权限，历史 Vault 只在显式 `audit migrate-v2` 后切换。当前 CLI 使用同盘 local mirror，不声称外部回滚保护。
+- 新 Vault 的控制面/Secret 决策写入 Audit V2；`audit list` 需要独立 `read_audit` 权限，历史 Vault 只在显式 `audit migrate-v2` 后切换。默认仍是同盘 local mirror。`audit serve-anchor` 在独立数据目录启动 loopback CAS，默认要求 `--tls-cert`/`--tls-key`；`--allow-plaintext` 只用于测试。Token 绑定首次访问的 Vault，并写 value-free `access.jsonl`。`configure-anchor` 在 Owner 解锁后写入 Vault 旁 sidecar：`https://` 必须带 `--tls-ca`，`http://` 必须带 `--allow-plaintext`。之后轮换按 mandatory 失败关闭。`anchor-status` 只输出 mode、endpoint、token 路径、tls 状态、last-confirmed generation/digest 和是否存在回滚证据，不输出 token 或 Secret。这仍不是远程 WORM 或硬件锚点。
 - `profile create` 只生成环境名到 SecretId 的 value-free 请求集合；`policy grant-use` 才执行显式精确授权。
 - `run` 严格读取 credential、建立机器 `VerifiedCaller`，对 Profile 每个 SecretId 独立执行 `use` 和 Audit，全部 Allow 后才创建最小环境子进程。
 

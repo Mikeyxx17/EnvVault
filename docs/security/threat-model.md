@@ -131,7 +131,7 @@ Vault 文件及其元数据是不可信输入。解密前必须验证格式、�
 - Application 与 AI Agent credential 仍由不覆盖私有文件和 recovery 协议管理；是否迁移到独立平台项，以及 machine-unlock sidecar/凭据项如何完成真实断电级恢复证明？
 - authentication attempt 已统一记录、保留 dummy KDF 并加入持久化 bucket/global 限流；如何完成多进程、时钟操纵、全局可用性攻击和 Audit 容量滥用的真实运行验收？
 - 当前 Vault 与 Policy 使用同一 Master Key、不同 AAD 域；何时需要独立子密钥？
-- Audit V2 已轮换并支持本地 CAS/degraded 原语；选择何种远程或硬件单调 AnchorSink，并如何完成服务端回滚与可用性验收？
+- Audit V2 已轮换并支持本地 CAS、loopback 参考 HTTPS CAS 与 last-confirmed 回滚检测；如何完成真实远程 WORM/硬件 AnchorSink 的服务端回滚与可用性验收？
 - 是否在第一版支持 `ReadPlaintext` 和 `Export`，还是只为 Human 管理路径保留？
 - Windows 上如何处理进程身份、文件 ACL、重解析点和内存保护？
 - Vault 回滚检测的可信状态保存在哪里？

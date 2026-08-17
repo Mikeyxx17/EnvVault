@@ -1,6 +1,6 @@
 # Audit V2 Rotation Fault-injection Matrix
 
-状态：Manifest V2 状态机、active/sealed key envelope 认证、segment staging 故障点、Descriptor V3 generation 提交、三文件本地恢复和 local-mirror anchor CAS deterministic tests 已实现；远程 anchor、进程终止和断电验证尚未通过。
+状态：Manifest V2 状态机、active/sealed key envelope 认证、segment staging 故障点、Descriptor V3 generation 提交、三文件本地恢复和 local-mirror / loopback CAS deterministic tests 已实现。远程锚点文件不变量有本机 harness 冒烟（`remote-anchor` 场景）；真实进程终止、目录断电和远程 WORM 验收尚未通过。
 
 ## 恢复状态
 
@@ -43,6 +43,8 @@ Recovery manifest 只能按以下顺序前进：`prepared → sealed-file-synced
 2. 文件层 deterministic failpoint tests：manifest create/update/tamper、pending key ciphertext 篡改、segment 空/半写/封存/篡改、segment/descriptor predecessor 断裂、descriptor 篡改/并发 generation、commit 后 manifest 未推进、sealed-key 保留和三文件幂等恢复已覆盖；anchor 和父目录 durability 的其余注入点仍需 Windows/Linux 实现。
 3. 多进程 generation/lock 压力测试。
 4. VM/真实磁盘强制终止与断电恢复。
-5. 外部 CAS sink 的超时、重复请求、冲突和服务端回滚测试。
+5. 外部 CAS sink 的超时、重复请求、冲突和服务端回滚：协议层与 loopback HTTP/HTTPS 自动化已覆盖；远程 WORM 部署级记录仍缺。
+6. 远程锚点 durable 文件（store / last-confirmed / rollback）的本机击杀场景已有合成 harness。
+7. 真实 Vault 轮换进程击杀（`envvault-fault-target`，本机 Linux `kill -9`）已覆盖 prepared/sealed/commit/anchor 四个窗口；Windows VM 与断电仍缺。
 
 只有第 1～2 层自动化通过不能声明真实断电安全；只有本地镜像通过也不能声明完整文件回滚防护。

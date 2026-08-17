@@ -3,7 +3,7 @@ use std::{
     fs,
     io::{Read as _, Write as _},
     path::Path,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,9 @@ use crate::{
 
 use super::{
     VaultError,
+    anchor_http::HttpAnchorTransport,
+    anchor_protocol::ProtocolAnchorClient,
+    anchor_store::{ConfirmedAnchorFile, load_anchor_client_config, load_anchor_token},
     audit_anchor::{AnchorCasResult, AnchorSink, LocalMirrorAnchorSink, collect_anchor_evidence},
     audit_descriptor::{DescriptorStore, lock_path_for},
     audit_recovery::{AnchorEvidence, AnchorMode, ManifestStore, RecoveryAction, RecoveryState},
@@ -53,13 +56,35 @@ impl AuditRuntimeV2 {
         }
     }
 
-    #[cfg(test)]
-    fn local_mirror_with_rotation_events(rotation_events: usize) -> Self {
+    /// Use a configured mandatory remote sink, or the local mirror default.
+    pub(crate) fn for_vault(vault_path: &Path, vault_id: [u8; 16]) -> Result<Self, VaultError> {
+        let Some(config) = load_anchor_client_config(vault_path)? else {
+            return Ok(Self::local_mirror());
+        };
+        let token = load_anchor_token(&config.token_file)?;
+        let confirmed = ConfirmedAnchorFile::for_vault(vault_path, vault_id);
+        let last_confirmed = confirmed.load()?;
+        let transport =
+            HttpAnchorTransport::new(&config.endpoint, token, config.tls_ca.as_deref())?;
+        let mut client = ProtocolAnchorClient::new(vault_id, transport, sleep_before_retry);
+        client.restore_last_confirmed(last_confirmed);
+        client.set_persistence(Box::new(confirmed));
+        Ok(Self::mandatory(Box::new(client)))
+    }
+
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub(crate) fn local_mirror_with_rotation_events(rotation_events: usize) -> Self {
         Self {
             anchor_mode: AnchorMode::LocalMirror,
             rotation_events,
             anchor_sink: Box::new(UnconfiguredSink),
         }
+    }
+
+    #[cfg(test)]
+    fn with_rotation_events(mut self, rotation_events: usize) -> Self {
+        self.rotation_events = rotation_events;
+        self
     }
 
     pub(super) fn mandatory(anchor_sink: Box<dyn AnchorSink>) -> Self {
@@ -315,6 +340,7 @@ impl AuditRuntimeV2 {
                 Self::create_empty_active_after_rotation(vault_path, master_key)?;
                 return Ok(());
             }
+            fault_injection_pause();
         }
         Err(VaultError::CorruptedAudit)
     }
@@ -340,6 +366,7 @@ impl AuditRuntimeV2 {
             self.anchor_mode,
             expected_anchor_generation,
         )?;
+        fault_injection_pause();
         self.recover(vault_path, master_key)
     }
 
@@ -398,12 +425,34 @@ impl AnchorSink for UnconfiguredSink {
     }
 }
 
+fn fault_injection_pause() {
+    #[cfg(feature = "fault-injection")]
+    {
+        if let Ok(raw) = std::env::var("ENVVAULT_FAULT_PAUSE_MS")
+            && let Ok(ms) = raw.parse::<u64>()
+            && (1..=5_000).contains(&ms)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+}
+
 fn parse_anchor_generation(bytes: &[u8]) -> Result<u64, VaultError> {
     let anchor = super::audit_v2::parse_anchor(bytes)?;
     if super::audit_v2::serialize_anchor(&anchor)? != bytes {
         return Err(VaultError::InvalidFormat);
     }
     Ok(anchor.anchor_generation())
+}
+
+fn sleep_before_retry(attempt: u32) -> Duration {
+    let shift = u32::min(attempt, 4);
+    let base = 100_u64.saturating_mul(1_u64 << shift);
+    let jitter = crate::crypto::generate_array::<1>()
+        .map_or(0, |bytes| u64::from(bytes[0]) % (base / 2 + 1));
+    let duration = Duration::from_millis(base.saturating_add(jitter).min(1_600));
+    std::thread::sleep(duration);
+    duration
 }
 
 fn current_unix_time_millis() -> u64 {
@@ -571,6 +620,41 @@ mod tests {
         ) -> Result<AnchorCasResult, VaultError> {
             Err(VaultError::NotFound)
         }
+    }
+
+    #[test]
+    fn mandatory_http_cas_confirms_rotation_and_persists_last_confirmed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("vault.json");
+        let password = MasterPassword::new(b"http-anchor-runtime".to_vec());
+        let vault = FileVault::create(&path, &password, b"identity", b"policy")?;
+        AuditRuntimeV2::initialize_new(&path, vault.vault_id(), vault.master_key())?;
+        let data_dir = directory.path().join("anchor-data");
+        let bound = crate::vault::AnchorHttpServer::bind(&data_dir, "127.0.0.1:0", None)?;
+        let addr = bound.server.local_addr()?;
+        let token_path = bound.token_path.clone();
+        let mut server = bound.server;
+        let _worker = std::thread::spawn(move || {
+            let _ = server.serve_forever();
+        });
+        crate::vault::configure_anchor_client(
+            &path,
+            &format!("http://{addr}"),
+            &token_path,
+            None,
+            true,
+        )?;
+        let mut runtime =
+            AuditRuntimeV2::for_vault(&path, vault.vault_id())?.with_rotation_events(1);
+        runtime.append(&path, vault.master_key(), event(1))?;
+        let status = crate::vault::load_anchor_status(&path, Some(vault.vault_id()))?;
+        assert_eq!(status.last_confirmed_generation, Some(1));
+        assert!(status.last_confirmed_digest.is_some());
+        let mut reopened =
+            AuditRuntimeV2::for_vault(&path, vault.vault_id())?.with_rotation_events(1);
+        assert_eq!(reopened.read_all(&path, vault.master_key())?.len(), 1);
+        Ok(())
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::io;
 
 use crate::{
     broker::BrokerError, config::ProjectError, dotenv::DotenvError, identity::CallerNameError,
-    process::ProcessError, profile::ProfileError, secret::SecretNameError,
+    process::ProcessError, profile::ProfileError, secret::SecretNameError, vault::VaultError,
 };
 
 /// Safe CLI failure categories that never carry password or credential bytes.
@@ -34,6 +34,10 @@ pub(super) enum CliError {
     ConfirmationUnavailable,
     ConfirmationRejected,
     UninstallUnavailable,
+    AnchorUnavailable,
+    AnchorAlreadyExists,
+    AnchorTokenMissing,
+    AnchorInvalid,
 }
 
 impl fmt::Display for CliError {
@@ -95,6 +99,18 @@ impl fmt::Display for CliError {
             Self::UninstallUnavailable => {
                 formatter.write_str("uninstall could not complete safely")
             }
+            Self::AnchorUnavailable => {
+                formatter.write_str("the Audit anchor service could not be used safely")
+            }
+            Self::AnchorAlreadyExists => {
+                formatter.write_str("anchor token file already exists; refusing to overwrite it")
+            }
+            Self::AnchorTokenMissing => {
+                formatter.write_str("anchor token file was not found")
+            }
+            Self::AnchorInvalid => {
+                formatter.write_str("anchor configuration or endpoint is invalid")
+            }
         }
     }
 }
@@ -152,5 +168,16 @@ impl From<ProcessError> for CliError {
 impl From<io::Error> for CliError {
     fn from(_value: io::Error) -> Self {
         Self::OutputUnavailable
+    }
+}
+
+impl From<VaultError> for CliError {
+    fn from(value: VaultError) -> Self {
+        match value {
+            VaultError::AlreadyExists => Self::AnchorAlreadyExists,
+            VaultError::NotFound => Self::AnchorTokenMissing,
+            VaultError::InvalidFormat | VaultError::UnsupportedVersion => Self::AnchorInvalid,
+            _ => Self::AnchorUnavailable,
+        }
     }
 }

@@ -46,6 +46,29 @@ pub(super) fn execute(
         super::uninstall::execute(purge_project, project.as_ref(), sensitive_input, output)?;
         return Ok(ExecutionOutcome::Success);
     }
+    if let Command::Audit {
+        command:
+            AuditCommand::ServeAnchor {
+                data_dir,
+                listen,
+                token_file,
+                tls_cert,
+                tls_key,
+                allow_plaintext,
+            },
+    } = cli.command
+    {
+        execute_serve_anchor(
+            &data_dir,
+            listen.as_deref(),
+            token_file.as_deref(),
+            tls_cert.as_deref(),
+            tls_key.as_deref(),
+            allow_plaintext,
+            output,
+        )?;
+        return Ok(ExecutionOutcome::Success);
+    }
     let vault = resolve_vault(cli.vault.as_deref(), project.as_ref(), &cli.command)?;
     dispatch(cli, &vault, project.as_mut(), sensitive_input, output)
 }
@@ -316,22 +339,152 @@ fn execute_audit(
     sensitive_input: &mut dyn SensitiveInput,
     output: &mut dyn Write,
 ) -> Result<(), CliError> {
-    let password = sensitive_input.read_existing()?;
     match command {
         AuditCommand::List => {
+            let password = sensitive_input.read_existing()?;
             let mut application = CliApplication::open_owner(vault, &password)?;
             for event in application.audit_events()? {
                 write_audit_event(output, event)?;
             }
         }
         AuditCommand::MigrateV2 => {
+            let password = sensitive_input.read_existing()?;
             let mut application = CliApplication::open_owner_for_audit_migration(vault, &password)?;
             let migrated = application.migrate_audit_v2()?;
             writeln!(output, "Audit V2 migration completed")?;
             writeln!(output, "migrated_events: {migrated}")?;
         }
+        AuditCommand::ServeAnchor { .. } => {
+            return Err(CliError::AnchorUnavailable);
+        }
+        AuditCommand::ConfigureAnchor {
+            endpoint,
+            token_file,
+            tls_ca,
+            allow_plaintext,
+        } => {
+            let password = sensitive_input.read_existing()?;
+            let _application = CliApplication::open_owner(vault, &password)?;
+            crate::vault::configure_anchor_client(
+                vault,
+                &endpoint,
+                &token_file,
+                tls_ca.as_deref(),
+                allow_plaintext,
+            )?;
+            writeln!(output, "mandatory Audit anchor configured")?;
+            writeln!(output, "mode: mandatory")?;
+            writeln!(output, "endpoint: {endpoint}")?;
+            writeln!(output, "token_file: {}", token_file.display())?;
+            if let Some(ca) = tls_ca {
+                writeln!(output, "tls_ca: {}", ca.display())?;
+            }
+            writeln!(output, "allow_plaintext: {allow_plaintext}")?;
+        }
+        AuditCommand::AnchorStatus => {
+            write_anchor_status(vault, output)?;
+        }
     }
     Ok(())
+}
+
+fn execute_serve_anchor(
+    data_dir: &Path,
+    listen: Option<&str>,
+    token_file: Option<&Path>,
+    tls_cert: Option<&Path>,
+    tls_key: Option<&Path>,
+    allow_plaintext: bool,
+    output: &mut dyn Write,
+) -> Result<(), CliError> {
+    let listen = listen.unwrap_or_else(|| crate::vault::default_listen_addr());
+    let mut bound = match (tls_cert, tls_key, allow_plaintext) {
+        (Some(cert), Some(key), false) => {
+            crate::vault::AnchorHttpServer::bind_tls(data_dir, listen, token_file, cert, key)?
+        }
+        (None, None, true) => crate::vault::AnchorHttpServer::bind(data_dir, listen, token_file)?,
+        _ => return Err(CliError::AnchorInvalid),
+    };
+    let addr = bound.server.local_addr()?;
+    writeln!(output, "Audit anchor CAS listening")?;
+    writeln!(output, "listen: {addr}")?;
+    writeln!(output, "data_dir: {}", data_dir.display())?;
+    writeln!(output, "token_file: {}", bound.token_path.display())?;
+    writeln!(
+        output,
+        "tls: {}",
+        if bound.server.tls_enabled() {
+            "rustls"
+        } else {
+            "none (explicit plaintext)"
+        }
+    )?;
+    output.flush()?;
+    bound.server.serve_forever()?;
+    Ok(())
+}
+
+fn write_anchor_status(vault: &Path, output: &mut dyn Write) -> Result<(), CliError> {
+    let status = crate::vault::load_anchor_status(vault, None)?;
+    writeln!(output, "configured: {}", status.configured)?;
+    if let Some(mode) = status.mode {
+        let _ = mode;
+        writeln!(output, "mode: mandatory")?;
+    }
+    if let Some(endpoint) = status.endpoint {
+        writeln!(output, "endpoint: {endpoint}")?;
+    }
+    if let Some(token_file) = status.token_file {
+        writeln!(output, "token_file: {}", token_file.display())?;
+    }
+    if let Some(ca) = status.tls_ca {
+        writeln!(output, "tls_ca: {}", ca.display())?;
+    }
+    writeln!(
+        output,
+        "tls: {}",
+        if status.allow_plaintext {
+            "none (explicit plaintext)"
+        } else if status.configured {
+            "rustls"
+        } else {
+            "none"
+        }
+    )?;
+    match status.last_confirmed_generation {
+        Some(generation) => writeln!(output, "last_confirmed_generation: {generation}")?,
+        None => writeln!(output, "last_confirmed_generation: none")?,
+    }
+    match status.last_confirmed_digest {
+        Some(digest) => writeln!(output, "last_confirmed_digest: {}", hex_digest(&digest))?,
+        None => writeln!(output, "last_confirmed_digest: none")?,
+    }
+    writeln!(
+        output,
+        "rollback_evidence: {}",
+        if status.rollback_evidence {
+            "yes"
+        } else {
+            "no"
+        }
+    )?;
+    if let Some(generation) = status.rollback_expected_generation {
+        writeln!(output, "rollback_expected_generation: {generation}")?;
+    }
+    if let Some(generation) = status.rollback_observed_generation {
+        writeln!(output, "rollback_observed_generation: {generation}")?;
+    }
+    Ok(())
+}
+
+fn hex_digest(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push(HEX[usize::from(byte >> 4)] as char);
+        out.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    out
 }
 
 fn write_audit_event(
@@ -1223,6 +1376,57 @@ mod tests {
 
         let output = String::from_utf8(output)?;
         assert!(!output.contains(std::str::from_utf8(secret)?));
+        Ok(())
+    }
+
+    #[test]
+    fn configure_anchor_is_value_free_and_status_hides_the_token()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let vault = directory.path().join("anchor.vault.json");
+        let token = directory.path().join("token.json");
+        crate::vault::issue_anchor_token_file(&token)?;
+        let token_bytes = fs::read_to_string(&token)?;
+        let password = b"anchor-cli-test-password";
+        let mut input = FixedSensitiveInput::repeated(password, 2);
+        let mut output = Vec::new();
+        execute(cli(vault.clone(), Command::Init), &mut input, &mut output)?;
+        output.clear();
+        execute(
+            cli(
+                vault.clone(),
+                Command::Audit {
+                    command: AuditCommand::ConfigureAnchor {
+                        endpoint: "http://127.0.0.1:7432".to_owned(),
+                        token_file: token.clone(),
+                        tls_ca: None,
+                        allow_plaintext: true,
+                    },
+                },
+            ),
+            &mut input,
+            &mut output,
+        )?;
+        let rendered = String::from_utf8(output.clone())?;
+        assert!(rendered.contains("mode: mandatory"));
+        assert!(rendered.contains("http://127.0.0.1:7432"));
+        assert!(!rendered.contains(&token_bytes));
+        output.clear();
+        execute(
+            cli(
+                vault,
+                Command::Audit {
+                    command: AuditCommand::AnchorStatus,
+                },
+            ),
+            &mut input,
+            &mut output,
+        )?;
+        let status = String::from_utf8(output)?;
+        assert!(status.contains("configured: true"));
+        assert!(status.contains("last_confirmed_generation: none"));
+        assert!(status.contains("rollback_evidence: no"));
+        assert!(!status.contains(&token_bytes));
         Ok(())
     }
 }
