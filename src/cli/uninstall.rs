@@ -163,12 +163,15 @@ mod tests {
         remove_path(&file)?;
         assert!(!file.exists());
 
-        let target = root.path().join("real");
-        let link = root.path().join("link");
-        fs::write(&target, b"x")?;
-        std::os::unix::fs::symlink(&target, &link)?;
-        assert!(remove_path(&link).is_err());
-        assert!(link.exists());
+        #[cfg(unix)]
+        {
+            let target = root.path().join("real");
+            let link = root.path().join("link");
+            fs::write(&target, b"x")?;
+            std::os::unix::fs::symlink(&target, &link)?;
+            assert!(remove_path(&link).is_err());
+            assert!(link.exists());
+        }
         Ok(())
     }
 

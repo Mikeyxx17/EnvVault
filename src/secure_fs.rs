@@ -68,7 +68,6 @@ pub(crate) fn protect_existing(path: &Path) -> io::Result<()> {
 }
 
 /// Applies and verifies private permissions on an already-open regular file.
-#[cfg(unix)]
 pub(crate) fn protect_open_file(file: &mut File) -> io::Result<()> {
     reject_reparse_handle(file)?;
     if !file.metadata()?.is_file() {

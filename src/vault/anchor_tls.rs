@@ -11,10 +11,8 @@ use std::{
     sync::{Arc, Once},
 };
 
-use rustls::{
-    ClientConfig, RootCertStore, ServerConfig,
-    pki_types::{CertificateDer, PrivateKeyDer, ServerName},
-};
+use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 
 use crate::vault::VaultError;
 
@@ -25,7 +23,7 @@ pub(super) fn server_config(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<Arc<ServerConfig>, VaultError> {
-    install_ring();
+    install_crypto_provider();
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
     let config = ServerConfig::builder()
@@ -37,7 +35,7 @@ pub(super) fn server_config(
 
 /// rustls client configuration that trusts one PEM CA / server certificate.
 pub(super) fn client_config(ca_path: &Path) -> Result<Arc<ClientConfig>, VaultError> {
-    install_ring();
+    install_crypto_provider();
     let certs = load_certs(ca_path)?;
     let mut roots = RootCertStore::empty();
     for cert in certs {
@@ -61,7 +59,7 @@ pub(super) fn loopback_server_name() -> Result<ServerName<'static>, VaultError> 
     ServerName::try_from("localhost").map_err(|_| VaultError::InvalidFormat)
 }
 
-fn install_ring() {
+fn install_crypto_provider() {
     INSTALL_PROVIDER.call_once(|| {
         let _ignored = rustls::crypto::ring::default_provider().install_default();
     });
