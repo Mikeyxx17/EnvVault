@@ -68,6 +68,7 @@ pub(crate) fn protect_existing(path: &Path) -> io::Result<()> {
 }
 
 /// Applies and verifies private permissions on an already-open regular file.
+#[cfg(unix)]
 pub(crate) fn protect_open_file(file: &mut File) -> io::Result<()> {
     reject_reparse_handle(file)?;
     if !file.metadata()?.is_file() {
@@ -167,9 +168,7 @@ fn configure_no_follow_and_private_create(options: &mut OpenOptions) {
 }
 
 #[cfg(windows)]
-fn configure_no_follow_and_private_create(options: &mut OpenOptions) {
-    let _ = options;
-}
+fn configure_no_follow_and_private_create(_options: &mut OpenOptions) {}
 
 #[cfg(not(any(unix, windows)))]
 fn configure_no_follow_and_private_create(_options: &mut OpenOptions) {}

@@ -6,13 +6,12 @@
 
 use std::{
     fs::File,
-    io::BufReader,
     path::Path,
     sync::{Arc, Once},
 };
 
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _};
 
 use crate::vault::VaultError;
 
@@ -67,8 +66,7 @@ fn install_crypto_provider() {
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, VaultError> {
     let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_reader_iter(file)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| VaultError::InvalidFormat)?;
     if certs.is_empty() {
@@ -79,10 +77,7 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, VaultError> {
 
 fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, VaultError> {
     let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|_| VaultError::InvalidFormat)?
-        .ok_or(VaultError::InvalidFormat)
+    PrivateKeyDer::from_pem_reader(file).map_err(|_| VaultError::InvalidFormat)
 }
 
 #[cfg(test)]
