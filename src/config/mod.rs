@@ -265,7 +265,9 @@ fn load(path: &Path) -> Result<Project, ProjectError> {
 
 fn resolve_member(root: &Path, raw: &str) -> Result<PathBuf, ProjectError> {
     let path = Path::new(raw);
-    if path.is_absolute() || raw.is_empty() {
+    // `is_absolute()` is false on Windows for `/tmp/x` and `\Windows\x`;
+    // those still have a root component and must not be joined.
+    if raw.is_empty() || path.is_absolute() || path.has_root() {
         return Err(ProjectError::InvalidFormat);
     }
     if path
@@ -364,6 +366,15 @@ mod tests {
             r#"{"format":"envvault-project","version":1,"vault":"/tmp/x.vault"}"#,
         )?;
         assert!(matches!(load(&path), Err(ProjectError::InvalidFormat)));
+
+        #[cfg(windows)]
+        {
+            fs::write(
+                &path,
+                r#"{"format":"envvault-project","version":1,"vault":"C:\\Windows\\x.vault"}"#,
+            )?;
+            assert!(matches!(load(&path), Err(ProjectError::InvalidFormat)));
+        }
         Ok(())
     }
 
