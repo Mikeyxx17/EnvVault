@@ -138,9 +138,11 @@ impl AuditRuntimeV2 {
             return Err(VaultError::AlreadyExists);
         } else {
             write_migration_marker(&marker_path, &expected_marker)?;
+            fault_injection_pause();
         }
         if !DescriptorStore::exists_for_vault(vault_path)? {
             Self::initialize_new(vault_path, vault_id, master_key)?;
+            fault_injection_pause();
         }
         let mut runtime = Self::local_mirror();
         let copied = runtime.read_all(vault_path, master_key)?;
@@ -366,7 +368,7 @@ impl AuditRuntimeV2 {
             self.anchor_mode,
             expected_anchor_generation,
         )?;
-        fault_injection_pause();
+        fault_injection_hold_at("prepared-manifest");
         self.recover(vault_path, master_key)
     }
 
@@ -435,6 +437,18 @@ fn fault_injection_pause() {
             std::thread::sleep(std::time::Duration::from_millis(ms));
         }
     }
+}
+
+fn fault_injection_hold_at(name: &str) {
+    #[cfg(feature = "fault-injection")]
+    {
+        if std::env::var("FAULT_HOLD_AT_CHECKPOINT").ok().as_deref() == Some(name) {
+            std::thread::sleep(std::time::Duration::from_mins(10));
+            return;
+        }
+    }
+    let _ = name;
+    fault_injection_pause();
 }
 
 fn parse_anchor_generation(bytes: &[u8]) -> Result<u64, VaultError> {

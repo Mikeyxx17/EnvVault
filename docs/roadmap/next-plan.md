@@ -29,13 +29,13 @@
 
 ### 1.2 崩溃与断电耐久性
 
-工程前置件已落地：合成轮换场景、远程锚点文件场景、真实 Vault 轮换进程击杀（feature `fault-injection`）、Unix 父目录 fsync，以及损坏 CAS store 失败关闭测试。本机 Linux `kill -9` 已覆盖 prepared-manifest / sealed-segment / vault-committed / anchor-confirmed。仍缺：
+工程前置件已落地：合成轮换场景、远程锚点文件场景、真实 Vault 轮换进程击杀（feature `fault-injection`）、Unix 父目录 fsync，以及损坏 CAS store 失败关闭测试。本机 Linux `kill -9` 已覆盖 prepared-manifest / sealed-segment / vault-committed / anchor-confirmed。本机 Windows `taskkill /T /F` 已覆盖合成 6 点、远程锚点 4 点、真实轮换 4 点（见 `docs/security/m1.2-windows-process-kill-record-v1.md`）。仍缺：
 
-- 在 Windows VM、Linux VM 和至少一种真实磁盘上执行完整 rotation/recovery 故障矩阵。
-- 在目录同步边界断电，以及交互式 `audit migrate-v2` 的真实 TTY 击杀。
+- 在 Windows VM、Linux VM 和至少一种真实磁盘上执行完整 rotation/recovery 故障矩阵（含断电）。
+- 在目录同步边界断电。交互式 `audit migrate-v2` 的本机 Windows TTY 进程击杀已留下 `20260817-082541`（prepared / sealed / vault-committed；`anchor-confirmed` 因 migrate 不写该 sidecar 未命中），断电未做。
 - 重启后不得丢失已经发放 Secret 对应的 Audit（当前击杀场景不发放 Secret）。
 
-完成证据：每个注入点的前置状态、终止方式、磁盘状态和恢复结果均留档。本机 `kill -9` 通过不能计入断电完成。
+完成证据：每个注入点的前置状态、终止方式、磁盘状态和恢复结果均留档。本机 `kill -9` 或 `taskkill /T /F` 通过不能计入断电完成。只完成了进程击杀，断电未做。
 
 ### 1.3 三平台真实运行矩阵
 

@@ -26,6 +26,11 @@ if (-not $work -or -not $checkpoints) {
 function Write-Checkpoint {
     param([Parameter(Mandatory)][string]$Name)
     New-Item -ItemType File -Force -Path (Join-Path $checkpoints $Name) | Out-Null
+    if ($env:FAULT_HOLD_AT_CHECKPOINT -eq $Name) {
+        # Stay in this window until the host hard-powers off the guest.
+        Start-Sleep -Seconds 600
+        return
+    }
     # Keep the injection window open long enough for the harness watcher.
     Start-Sleep -Milliseconds 250
 }

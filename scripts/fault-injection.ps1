@@ -33,7 +33,10 @@ PowerShell script implementing the post-restart verifier.
 Parent directory for per-run work directories (created as needed).
 
 .PARAMETER InjectAt
-Checkpoint names to inject at; one run per checkpoint.
+Checkpoint names to inject at; one run per checkpoint. Accepts a
+PowerShell string array or a single comma-separated list (same contract
+as fault-injection.sh --inject-at). The documented `pwsh ... -InjectAt
+a,b,c` invocation arrives as one string after native-command passing.
 
 .PARAMETER DelayMsAfterCheckpoint
 Extra delay between marker detection and the kill, in milliseconds.
@@ -82,6 +85,20 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Match bash `IFS=','` so `pwsh -File ... -InjectAt a,b,c` still expands
+# when the comma list arrives as a single native-command argument.
+$InjectAt = @(
+    foreach ($item in $InjectAt) {
+        foreach ($name in ($item -split ',')) {
+            $trimmed = $name.Trim()
+            if ($trimmed) { $trimmed }
+        }
+    }
+)
+if ($InjectAt.Count -eq 0) {
+    throw 'InjectAt must contain at least one checkpoint name.'
+}
+
 $scenarioPath = (Resolve-Path $ScenarioScript).Path
 $recoveryPath = (Resolve-Path $RecoveryScript).Path
 New-Item -ItemType Directory -Force -Path $WorkRoot | Out-Null
@@ -112,14 +129,26 @@ foreach ($checkpoint in $InjectAt) {
     }
     $env:FAULT_WORK_ROOT = $work
     $env:FAULT_CHECKPOINTS = $checkpoints
+    if ($PoweroffCommand) {
+        $env:FAULT_HOLD_AT_CHECKPOINT = $checkpoint
+    } else {
+        Remove-Item Env:FAULT_HOLD_AT_CHECKPOINT -ErrorAction SilentlyContinue
+    }
 
     $startArgs = if ($Interactive) {
         @('-NoProfile', '-File', $scenarioPath)
     } else {
         @('-NoProfile', '-NonInteractive', '-File', $scenarioPath)
     }
-    $child = Start-Process -FilePath $pwsh -ArgumentList $startArgs `
-        -PassThru -WorkingDirectory $work -WindowStyle Hidden
+    # Hidden windows have no usable TTY. -Interactive must inherit this
+    # console so Master Password prompts work.
+    $child = if ($Interactive) {
+        Start-Process -FilePath $pwsh -ArgumentList $startArgs `
+            -PassThru -WorkingDirectory $work -NoNewWindow
+    } else {
+        Start-Process -FilePath $pwsh -ArgumentList $startArgs `
+            -PassThru -WorkingDirectory $work -WindowStyle Hidden
+    }
 
     $marker = Join-Path $checkpoints $checkpoint
     $deadline = (Get-Date).AddSeconds($WatchTimeoutSeconds)
@@ -141,7 +170,8 @@ foreach ($checkpoint in $InjectAt) {
             Start-Sleep -Milliseconds $DelayMsAfterCheckpoint
         }
         if ($PoweroffCommand) {
-            Invoke-Expression $PoweroffCommand
+            # Write the pending record *before* power-off. This guest is often
+            # the VM being powered off; a record written afterwards is lost.
             $results += [ordered]@{
                 checkpoint            = $checkpoint
                 kill_mode             = 'poweroff'
@@ -149,7 +179,7 @@ foreach ($checkpoint in $InjectAt) {
                 scenario_exit_code    = $null
                 recovery              = [ordered]@{
                     verdict = 'pending_vm_restart'
-                    detail  = 'power-off executed; run the recovery script manually after the VM restarts'
+                    detail  = 'power-off requested; run the recovery script manually after the VM restarts'
                 }
             }
             $record = [ordered]@{
@@ -159,11 +189,15 @@ foreach ($checkpoint in $InjectAt) {
                 scenario      = (Split-Path $scenarioPath -Leaf)
                 recovery      = (Split-Path $recoveryPath -Leaf)
                 poweroff      = $PoweroffCommand
+                work_root     = $work
                 results       = $results
             }
+            $recordPath = Join-Path $runDir 'run.json'
             $record | ConvertTo-Json -Depth 6 |
-                Set-Content -Path (Join-Path $runDir 'run.json') -Encoding UTF8
-            Write-Host "==> Power-off requested at '$checkpoint'; record: $runDir\run.json"
+                Set-Content -Path $recordPath -Encoding UTF8
+            Write-Host "==> Power-off requested at '$checkpoint'; record: $recordPath"
+            Write-Host "==> After restart, recover FAULT_WORK_ROOT=$work"
+            Invoke-Expression $PoweroffCommand
             exit 0
         }
         if ($IsWindows) {
@@ -203,14 +237,34 @@ foreach ($checkpoint in $InjectAt) {
 
     $stdout = Join-Path $runDir "$checkpoint.recovery.out.log"
     $stderr = Join-Path $runDir "$checkpoint.recovery.err.log"
+    $verdictPath = Join-Path $work 'verdict.json'
+    $env:FAULT_VERDICT_PATH = $verdictPath
+    if (Test-Path -LiteralPath $verdictPath) {
+        Remove-Item -LiteralPath $verdictPath -Force
+    }
     $recoveryArgs = if ($Interactive) {
         @('-NoProfile', '-File', $recoveryPath)
     } else {
         @('-NoProfile', '-NonInteractive', '-File', $recoveryPath)
     }
-    $output = & $pwsh @recoveryArgs 2>$stderr | Out-String
-    $recoveryExit = $LASTEXITCODE
-    $output | Set-Content -Path $stdout -Encoding UTF8
+    if ($Interactive) {
+        # Inherit this console so Master Password prompts work. Verdict is
+        # read from FAULT_VERDICT_PATH because streams stay on the TTY.
+        $recoveryProc = Start-Process -FilePath $pwsh -ArgumentList $recoveryArgs `
+            -PassThru -WorkingDirectory $work -NoNewWindow -Wait
+        $recoveryExit = $recoveryProc.ExitCode
+        $output = if (Test-Path -LiteralPath $verdictPath) {
+            Get-Content -LiteralPath $verdictPath -Raw
+        } else {
+            ''
+        }
+        $output | Set-Content -Path $stdout -Encoding UTF8
+        Set-Content -Path $stderr -Value '' -Encoding UTF8
+    } else {
+        $output = & $pwsh @recoveryArgs 2>$stderr | Out-String
+        $recoveryExit = $LASTEXITCODE
+        $output | Set-Content -Path $stdout -Encoding UTF8
+    }
     $verdict = 'error'
     $detail = ''
     $parsed = $output | ConvertFrom-Json -ErrorAction SilentlyContinue

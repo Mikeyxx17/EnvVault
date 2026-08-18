@@ -20,10 +20,13 @@ function Find-FaultTarget {
     if ($env:ENVVAULT_FAULT_TARGET -and (Test-Path -LiteralPath $env:ENVVAULT_FAULT_TARGET)) {
         return $env:ENVVAULT_FAULT_TARGET
     }
+    $debugDir = $null
+    if ($env:ENVVAULT -and (Test-Path -LiteralPath $env:ENVVAULT)) {
+        $debugDir = Split-Path -Parent $env:ENVVAULT
+    }
     $candidates = @(
-        (Join-Path ($env:CARGO_TARGET_DIR) 'debug/envvault-fault-target.exe'),
-        'target/debug/envvault-fault-target.exe',
-        'target/debug/envvault-fault-target'
+        (if ($debugDir) { Join-Path $debugDir 'envvault-fault-target.exe' }),
+        (if ($env:CARGO_TARGET_DIR) { Join-Path $env:CARGO_TARGET_DIR 'debug/envvault-fault-target.exe' })
     )
     foreach ($candidate in $candidates) {
         if ($candidate -and (Test-Path -LiteralPath $candidate)) {

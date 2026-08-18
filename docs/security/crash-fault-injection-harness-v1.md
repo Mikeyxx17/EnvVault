@@ -1,6 +1,6 @@
 # Crash / Power-loss Fault-injection Harness V1
 
-状态：Harness、合成轮换场景、远程锚点文件场景，以及真实 Vault 轮换进程击杀场景已实现。本机 Linux 已冒烟：合成 6 点、远程锚点 4 点、真实轮换 4 点（`kill -9` 后全部 `recovered`）。Windows VM、真实磁盘和断电验证仍未做——本 harness 不构成任何断电安全声明。
+状态：Harness、合成轮换场景、远程锚点文件场景，以及真实 Vault 轮换进程击杀场景已实现。本机 Linux 已冒烟：合成 6 点、远程锚点 4 点、真实轮换 4 点（`kill -9` 后全部 `recovered`）。本机 Windows（Windows 10 专业版 / NTFS）已冒烟：合成 6 点、远程锚点 4 点、真实轮换 4 点（`taskkill /T /F`；记录见 [m1.2-windows-process-kill-record-v1.md](./m1.2-windows-process-kill-record-v1.md)）。本机 Windows 交互式 `audit migrate-v2` TTY 进程击杀已留下 `20260817-082541`（见 [m1.2-windows-process-kill-record-v1.md](./m1.2-windows-process-kill-record-v1.md)）。`anchor-confirmed` 未命中。Windows VM、真实磁盘和断电验证仍未做——只完成了进程击杀，断电未做。本 harness 不构成任何断电安全声明。
 
 ## 定位
 
@@ -37,10 +37,10 @@ pwsh scripts\fault-injection.ps1 `
   -InjectAt before-manifest,manifest-written,segment-half,segment-written,vault-committed,anchor-confirmed
 ```
 
-真实 EnvVault（需要交互式 Master Password，务必使用一次性测试 Vault）：
+真实 EnvVault（需要交互式 Master Password，务必使用一次性测试 Vault）。Windows 上必须在能打字的控制台运行 `-Interactive`（harness 会继承该控制台；Hidden 窗口无法输入密码）。`envvault init` 建出的是 Audit V2，不能用来测 `migrate-v2`。一次性 V1 测试库由 `envvault-fault-target init-v1` 创建（`FAULT_VAULT_PATH` 必须是该目录下的 `vault.json`）。提示出现时手打该二进制内的固定测试口令，不要放进 argv 或环境变量，也不要保护真实 Secret。
 
 ```powershell
-$env:FAULT_VAULT_PATH = 'D:\fault-test\test.vault'
+$env:FAULT_VAULT_PATH = 'D:\fault-test\vault.json'
 $env:FAULT_VAULT_DIR  = 'D:\fault-test'
 pwsh scripts\fault-injection.ps1 -Interactive `
   -ScenarioScript scripts\fault-injection-scenarios\envvault-migrate-v2\scenario.ps1 `

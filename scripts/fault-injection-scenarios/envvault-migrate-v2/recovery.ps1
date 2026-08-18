@@ -25,15 +25,36 @@ function Emit {
         [Parameter(Mandatory)][string]$Detail,
         [Parameter(Mandatory)][int]$ExitCode
     )
-    @{ verdict = $Verdict; detail = $Detail } | ConvertTo-Json -Compress
+    $line = @{ verdict = $Verdict; detail = $Detail } | ConvertTo-Json -Compress
+    $line
+    $verdictPath = $env:FAULT_VERDICT_PATH
+    if (-not $verdictPath -and $env:FAULT_WORK_ROOT) {
+        $verdictPath = Join-Path $env:FAULT_WORK_ROOT 'verdict.json'
+    }
+    if ($verdictPath) {
+        Set-Content -Path $verdictPath -Value $line -Encoding UTF8
+    }
     exit $ExitCode
 }
 
+$envvault = if ($env:ENVVAULT -and (Test-Path -LiteralPath $env:ENVVAULT)) {
+    $env:ENVVAULT
+} else {
+    $cmd = Get-Command envvault -ErrorAction SilentlyContinue
+    if ($cmd) { $cmd.Source } else { $null }
+}
+if (-not $envvault) {
+    Emit 'error' 'envvault not found; add target\debug to PATH or set ENVVAULT' 1
+}
+
 # `audit list` requires exact `read_audit` Owner authorization and only emits
-# value-free fields; a non-zero exit means the chain failed verification
-# (acceptable fail-closed) or the Vault refuses to open.
-& envvault --vault $vault audit list *> (Join-Path $env:FAULT_WORK_ROOT 'recovery-audit-list.log')
+# value-free fields. Leave stderr on the console so the Master Password TTY
+# prompt works; only persist stdout (value-free event lines).
+$log = Join-Path $env:FAULT_WORK_ROOT 'recovery-audit-list.log'
+$listed = & $envvault --vault $vault --masked-input audit list
 $exit = $LASTEXITCODE
+if ($null -eq $listed) { $listed = @() }
+$listed | Set-Content -Path $log -Encoding UTF8
 if ($exit -eq 0) {
     Emit 'recovered' 'audit chain verified after restart' 0
 }

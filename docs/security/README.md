@@ -16,6 +16,7 @@
 - [Independent Security Review Checklist V1](./independent-review-checklist-v1.md)
 - [Three-platform Real-runtime Matrix V1](./real-runtime-matrix-v1.md)
 - [Crash Fault-injection Harness V1](./crash-fault-injection-harness-v1.md)
+- [M1.2 Windows Process-kill Record V1](./m1.2-windows-process-kill-record-v1.md)
 - [Dependency and Supply-chain Policy V1](./supply-chain-v1.md)
 - [Audit V2 Canonical Format](./audit-v2-format.md)
 - [Audit V2 Rotation Fault-injection Matrix](./audit-rotation-fault-matrix.md)

@@ -1,6 +1,6 @@
 # Audit V2 Rotation Fault-injection Matrix
 
-状态：Manifest V2 状态机、active/sealed key envelope 认证、segment staging 故障点、Descriptor V3 generation 提交、三文件本地恢复和 local-mirror / loopback CAS deterministic tests 已实现。远程锚点文件不变量有本机 harness 冒烟（`remote-anchor` 场景）；真实进程终止、目录断电和远程 WORM 验收尚未通过。
+状态：Manifest V2 状态机、active/sealed key envelope 认证、segment staging 故障点、Descriptor V3 generation 提交、三文件本地恢复和 local-mirror / loopback CAS deterministic tests 已实现。远程锚点文件不变量有本机 Linux 与本机 Windows harness 冒烟（`remote-anchor` 场景）。本机 Windows 进程击杀记录见 [m1.2-windows-process-kill-record-v1.md](./m1.2-windows-process-kill-record-v1.md)。目录断电、Windows VM 和远程 WORM 验收尚未通过。
 
 ## 恢复状态
 
@@ -45,6 +45,6 @@ Recovery manifest 只能按以下顺序前进：`prepared → sealed-file-synced
 4. VM/真实磁盘强制终止与断电恢复。
 5. 外部 CAS sink 的超时、重复请求、冲突和服务端回滚：协议层与 loopback HTTP/HTTPS 自动化已覆盖；远程 WORM 部署级记录仍缺。
 6. 远程锚点 durable 文件（store / last-confirmed / rollback）的本机击杀场景已有合成 harness。
-7. 真实 Vault 轮换进程击杀（`envvault-fault-target`，本机 Linux `kill -9`）已覆盖 prepared/sealed/commit/anchor 四个窗口；Windows VM 与断电仍缺。
+7. 真实 Vault 轮换进程击杀（`envvault-fault-target`）已覆盖 prepared/sealed/commit/anchor 四个窗口：本机 Linux `kill -9`，以及本机 Windows `taskkill /T /F`（见 [m1.2-windows-process-kill-record-v1.md](./m1.2-windows-process-kill-record-v1.md)）。Windows VM 与断电仍缺；只完成了进程击杀，断电未做。当前击杀场景不发放 Secret。
 
 只有第 1～2 层自动化通过不能声明真实断电安全；只有本地镜像通过也不能声明完整文件回滚防护。

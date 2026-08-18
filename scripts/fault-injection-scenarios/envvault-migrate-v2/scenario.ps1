@@ -12,9 +12,9 @@ and $env:FAULT_VAULT_DIR (the directory containing it).
 
 Markers:
 
-  prepared-manifest  <vault>.audit-rotation-recovery.json appears
+  prepared-manifest  migration or rotation recovery sidecar appears
   sealed-segment     a new sidecar file appears (segment staging/sealed)
-  vault-committed    the Vault file content changes (descriptor commit)
+  vault-committed    Vault length changes or descriptor appears
   anchor-confirmed   <vault>.audit-anchor-v2.json is written/updated
 #>
 
@@ -28,19 +28,71 @@ if (-not $vault -or -not $vaultDir -or -not $checkpoints) {
     throw 'FAULT_VAULT_PATH, FAULT_VAULT_DIR and FAULT_CHECKPOINTS must be set.'
 }
 
-function Write-Checkpoint {
-    param([Parameter(Mandatory)][string]$Name)
-    New-Item -ItemType File -Force -Path (Join-Path $checkpoints $Name) | Out-Null
+function Find-EnvVault {
+    if ($env:ENVVAULT -and (Test-Path -LiteralPath $env:ENVVAULT)) {
+        return $env:ENVVAULT
+    }
+    $cmd = Get-Command envvault -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    throw 'envvault not found; add target\debug to PATH or set ENVVAULT'
 }
 
-$manifestName = "$vault.audit-rotation-recovery.json"
-$anchorName = "$vault.audit-anchor-v2.json"
-$confirmedName = "$vault.audit-anchor-confirmed.json"
+function Find-FaultTarget {
+    if ($env:ENVVAULT_FAULT_TARGET -and (Test-Path -LiteralPath $env:ENVVAULT_FAULT_TARGET)) {
+        return $env:ENVVAULT_FAULT_TARGET
+    }
+    $debugDir = $null
+    if ($env:ENVVAULT -and (Test-Path -LiteralPath $env:ENVVAULT)) {
+        $debugDir = Split-Path -Parent $env:ENVVAULT
+    }
+    $candidates = @(
+        (if ($debugDir) { Join-Path $debugDir 'envvault-fault-target.exe' }),
+        (if ($debugDir) { Join-Path $debugDir 'envvault-fault-target' })
+    )
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
+    }
+    throw 'envvault-fault-target not found; set ENVVAULT_FAULT_TARGET or ENVVAULT to the debug binaries'
+}
+
+function Reset-ThrowawayV1 {
+    $target = Find-FaultTarget
+    $leaf = Split-Path -Leaf $vault
+    Get-ChildItem -LiteralPath $vaultDir -File -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -eq $leaf -or
+            $_.Name.StartsWith("$leaf.") -or
+            $_.Name.StartsWith('envvault-audit-segment-')
+        } |
+        Remove-Item -Force
+    & $target init-v1 --work-root $vaultDir
+    if ($LASTEXITCODE -ne 0) { throw "init-v1 failed with exit $LASTEXITCODE" }
+    if (-not (Test-Path -LiteralPath $vault)) {
+        throw "init-v1 did not create $vault (expected vault.json under FAULT_VAULT_DIR)"
+    }
+}
+
+if (-not $env:ENVVAULT_FAULT_PAUSE_MS) {
+    $env:ENVVAULT_FAULT_PAUSE_MS = '400'
+}
+Reset-ThrowawayV1
+$envvault = Find-EnvVault
+
+# Sidecar names are the vault *file name* plus a suffix. Comparing
+# $_.Name to the full vault path never matches on Windows.
+$vaultLeaf = Split-Path -Leaf $vault
+$manifestName = "$vaultLeaf.audit-rotation-recovery.json"
+$migrationName = "$vaultLeaf.audit-migration-v2.json"
+$anchorName = "$vaultLeaf.audit-anchor-v2.json"
+$confirmedName = "$vaultLeaf.audit-anchor-confirmed.json"
+$descriptorName = "$vaultLeaf.audit-descriptor-v3.json"
 $known = @{
-    $manifestName = $true
-    $anchorName   = $true
-    $confirmedName = $true
-    "$vault.audit-descriptor-v3.json" = $true
+    $vaultLeaf      = $true
+    $manifestName   = $true
+    $migrationName  = $true
+    $anchorName     = $true
+    $confirmedName  = $true
+    $descriptorName = $true
 }
 $vaultLengthBefore = if (Test-Path -LiteralPath $vault) {
     (Get-Item -LiteralPath $vault).Length
@@ -48,9 +100,10 @@ $vaultLengthBefore = if (Test-Path -LiteralPath $vault) {
     0
 }
 
+$descriptorExisted = Test-Path -LiteralPath (Join-Path $vaultDir $descriptorName)
+
 $watcher = Start-Job -ScriptBlock {
-    param($dir, $knownNames, $manifestName, $anchorName, $confirmedName, $vaultPath, $vaultLengthBefore)
-    $checkpoints = $env:FAULT_CHECKPOINTS
+    param($dir, $knownNames, $manifestName, $migrationName, $anchorName, $confirmedName, $descriptorName, $vaultPath, $vaultLengthBefore, $descriptorExisted, $checkpointDir)
     $reportedManifest = $false
     $reportedSealed = $false
     $reportedVault = $false
@@ -59,23 +112,26 @@ $watcher = Start-Job -ScriptBlock {
     while ((Get-Date) -lt $end) {
         $entries = Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue
         if (-not $reportedManifest) {
-            if ($entries | Where-Object { $_.Name -eq $manifestName }) {
+            if ($entries | Where-Object { $_.Name -eq $manifestName -or $_.Name -eq $migrationName }) {
                 New-Item -ItemType File -Force `
-                    -Path (Join-Path $checkpoints 'prepared-manifest') | Out-Null
+                    -Path (Join-Path $checkpointDir 'prepared-manifest') | Out-Null
                 $reportedManifest = $true
             }
         }
         if (-not $reportedSealed) {
             if ($entries | Where-Object { -not $knownNames.ContainsKey($_.Name) }) {
                 New-Item -ItemType File -Force `
-                    -Path (Join-Path $checkpoints 'sealed-segment') | Out-Null
+                    -Path (Join-Path $checkpointDir 'sealed-segment') | Out-Null
                 $reportedSealed = $true
             }
         }
-        if (-not $reportedVault -and (Test-Path -LiteralPath $vaultPath)) {
-            if ((Get-Item -LiteralPath $vaultPath).Length -ne $vaultLengthBefore) {
+        if (-not $reportedVault) {
+            $vaultChanged = (Test-Path -LiteralPath $vaultPath) -and
+                ((Get-Item -LiteralPath $vaultPath).Length -ne $vaultLengthBefore)
+            $descriptorNow = Test-Path -LiteralPath (Join-Path $dir $descriptorName)
+            if ($vaultChanged -or ($descriptorNow -and -not $descriptorExisted)) {
                 New-Item -ItemType File -Force `
-                    -Path (Join-Path $checkpoints 'vault-committed') | Out-Null
+                    -Path (Join-Path $checkpointDir 'vault-committed') | Out-Null
                 $reportedVault = $true
             }
         }
@@ -85,16 +141,16 @@ $watcher = Start-Job -ScriptBlock {
             }
             if ($anchor) {
                 New-Item -ItemType File -Force `
-                    -Path (Join-Path $checkpoints 'anchor-confirmed') | Out-Null
+                    -Path (Join-Path $checkpointDir 'anchor-confirmed') | Out-Null
                 $reportedAnchor = $true
             }
         }
         Start-Sleep -Milliseconds 100
     }
-} -ArgumentList $vaultDir, $known, $manifestName, $anchorName, $confirmedName, $vault, $vaultLengthBefore
+} -ArgumentList $vaultDir, $known, $manifestName, $migrationName, $anchorName, $confirmedName, $descriptorName, $vault, $vaultLengthBefore, $descriptorExisted, $checkpoints
 
 try {
-    & envvault --vault $vault audit migrate-v2
+    & $envvault --vault $vault --masked-input audit migrate-v2
 } finally {
     Stop-Job -Job $watcher -ErrorAction SilentlyContinue
     Remove-Job -Job $watcher -Force -ErrorAction SilentlyContinue

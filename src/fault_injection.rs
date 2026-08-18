@@ -18,13 +18,19 @@ use std::{
 use crate::{
     audit::AuditEvent,
     crypto::MasterPassword,
-    identity::{AuthenticationMethod, Caller, CallerId, CallerKind},
-    policy::{Operation, PolicyDecision},
+    identity::{AuthenticationMethod, Caller, CallerId, CallerKind, IdentityRegistryDocument},
+    policy::{
+        Operation, PolicyDecision, PolicyDocument, PolicyEffect, PolicySet, VaultOperation,
+        VaultPolicyRule, VaultPolicySet,
+    },
     secret::SecretId,
     vault::{AuditRuntimeV2, FileVault, VaultError},
 };
 
 const TEST_PASSWORD: &[u8] = b"envvault-fault-injection-only";
+/// Throwaway password for interactive `audit migrate-v2` TTY kills.
+/// Typed at the console only; never passed in argv or the environment.
+const INIT_V1_PASSWORD: &[u8] = b"test";
 const INIT_FORMAT: &str = "envvault-fault-init";
 const INIT_VERSION: u32 = 1;
 
@@ -32,8 +38,8 @@ const INIT_VERSION: u32 = 1;
 ///
 /// # Errors
 ///
-/// Returns a process exit code. `0` is success for `init`/`rotate` and
-/// `recovered` for `recover`; `2` is `fail_closed`; `3` is `data_loss`.
+/// Returns a process exit code. `0` is success for `init`/`init-v1`/`rotate`
+/// and `recovered` for `recover`; `2` is `fail_closed`; `3` is `data_loss`.
 #[must_use]
 pub fn main_from_args<I, T>(args: I) -> i32
 where
@@ -62,7 +68,7 @@ where
     while index < args.len() {
         let arg = args[index].to_string_lossy();
         match arg.as_ref() {
-            "init" | "rotate" | "recover" => {
+            "init" | "init-v1" | "rotate" | "recover" => {
                 command = Some(arg.into_owned());
                 index += 1;
             }
@@ -81,13 +87,17 @@ where
             init(&work)?;
             Ok(0)
         }
+        Some("init-v1") => {
+            init_v1(&work)?;
+            Ok(0)
+        }
         Some("rotate") => {
             let checkpoints = checkpoints.ok_or_else(|| "missing --checkpoints".to_owned())?;
             rotate(&work, &checkpoints)?;
             Ok(0)
         }
         Some("recover") => Ok(recover(&work)),
-        _ => Err("expected init, rotate, or recover".to_owned()),
+        _ => Err("expected init, init-v1, rotate, or recover".to_owned()),
     }
 }
 
@@ -124,6 +134,55 @@ fn init(work: &Path) -> Result<(), String> {
     let bytes = fs::metadata(&vault).map_or(0, |meta| meta.len());
     let document = format!(
         "{{\"format\":\"{INIT_FORMAT}\",\"version\":{INIT_VERSION},\"vault_bytes\":{bytes}}}\n"
+    );
+    fs::write(init_marker(work), document).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn init_v1(work: &Path) -> Result<(), String> {
+    fs::create_dir_all(work).map_err(|error| error.to_string())?;
+    let vault = vault_path(work);
+    if vault.exists() {
+        return Err("vault.json already exists".to_owned());
+    }
+    let password = MasterPassword::new(INIT_V1_PASSWORD.to_vec());
+    let owner_id = CallerId::from_bytes([0x91; 16]);
+    let identity = IdentityRegistryDocument::new(1, owner_id)
+        .encode()
+        .map_err(|error| error.to_string())?;
+    let owner = Caller::new(owner_id, CallerKind::Human);
+    let mut vault_policy = VaultPolicySet::new();
+    for operation in [
+        VaultOperation::CreateSecret,
+        VaultOperation::ManagePolicy,
+        VaultOperation::ManageIdentity,
+        VaultOperation::ReadAudit,
+        VaultOperation::ManageKeystore,
+    ] {
+        if !vault_policy.insert(VaultPolicyRule::new(owner, operation, PolicyEffect::Allow)) {
+            return Err("duplicate vault policy rule".to_owned());
+        }
+    }
+    let policy = PolicyDocument::new_with_vault_policy(1, PolicySet::new(), vault_policy)
+        .and_then(|document| document.encode())
+        .map_err(|error| error.to_string())?;
+    let mut file = FileVault::create(&vault, &password, &identity, &policy)
+        .map_err(|error| error.to_string())?;
+    let event = AuditEvent::now_vault(
+        owner,
+        AuthenticationMethod::MasterPassword,
+        VaultOperation::ReadAudit,
+        PolicyDecision::Allow,
+    );
+    file.append_audit_payload(
+        &event
+            .encode()
+            .map_err(|_| "audit event encode failed".to_owned())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let bytes = fs::metadata(&vault).map_or(0, |meta| meta.len());
+    let document = format!(
+        "{{\"format\":\"{INIT_FORMAT}\",\"version\":{INIT_VERSION},\"audit\":\"v1\",\"vault_bytes\":{bytes}}}\n"
     );
     fs::write(init_marker(work), document).map_err(|error| error.to_string())?;
     Ok(())
@@ -277,7 +336,8 @@ fn mark(checkpoints: &Path, name: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{init, recover, rotate};
+    use super::{init, init_v1, recover, rotate, vault_path};
+    use crate::vault::AuditRuntimeV2;
     use tempfile::tempdir;
 
     #[test]
@@ -289,6 +349,17 @@ mod tests {
         init(work)?;
         rotate(work, &checkpoints)?;
         assert_eq!(recover(work), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn init_v1_creates_a_legacy_vault_without_v2_sidecars() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = tempdir()?;
+        let work = root.path();
+        init_v1(work)?;
+        assert!(vault_path(work).exists());
+        assert!(!AuditRuntimeV2::exists(vault_path(work).as_path())?);
         Ok(())
     }
 }
