@@ -1,13 +1,13 @@
 # Dependency and Supply-chain Policy V1
 
-状态：本机策略与 CI workflow 已建立；当前 RustSec 数据库扫描无已知漏洞。CI 尚未在远端实际运行。
+状态：本机策略与 CI workflow 已建立；当前 RustSec 数据库扫描无已知漏洞。远端 Security checks 曾在 job setup 失败；检出改为 git fetch。
 
 ## 固定边界
 
-- 主工程锁定 Rust 1.97 和已提交 `Cargo.lock`；
+- 主工程锁定 Rust 1.97.1 和已提交 `Cargo.lock`；
 - CI 安装固定版本 `cargo-audit 0.22.2`、`cargo-deny 0.20.2` 和 `cargo-fuzz 0.13.2`；
 - fuzz CI 使用 `nightly-2026-07-31`，避免每日 nightly 漂移；
-- GitHub Actions 使用完整 commit SHA；
+- Security checks 用 `git fetch` + `GITHUB_TOKEN` 检出仓库，不依赖 JavaScript `actions/checkout`（v4/v7 均在 job setup 阶段失败且无 step 日志）；
 - Cargo 来源只允许 crates.io registry，不允许未知 registry 或 Git dependency；
 - wildcard dependency 被拒绝；项目为 `publish = false`，private workspace license 不参与第三方 license 判定。
 

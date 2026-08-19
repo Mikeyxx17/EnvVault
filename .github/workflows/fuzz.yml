@@ -21,6 +21,10 @@ env:
   NIGHTLY: nightly-2026-07-31
   CARGO_FUZZ_VERSION: 0.13.2
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   libfuzzer:
     runs-on: ubuntu-latest
@@ -29,7 +33,21 @@ jobs:
       matrix:
         target: [vault, identity_audit, policy_profile, dotenv]
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -eux
+          git init
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git config --global --add safe.directory '*'
+          git -c http.extraheader="AUTHORIZATION: bearer ${GH_TOKEN}" \
+            fetch --no-tags --prune --depth 1 origin "${GITHUB_SHA}" \
+            || git -c http.extraheader="AUTHORIZATION: bearer ${GH_TOKEN}" \
+              fetch --no-tags --prune --depth 1 origin "${GITHUB_REF}"
+          git checkout --force FETCH_HEAD
+          git log -1 --oneline
 
       - name: Install nightly Rust with llvm-tools
         run: rustup toolchain install $NIGHTLY --profile minimal --component llvm-tools-preview
@@ -68,7 +86,7 @@ jobs:
 
       - name: Upload corpus
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: corpus-${{ matrix.target }}
           path: fuzz/corpus/${{ matrix.target }}
@@ -76,7 +94,7 @@ jobs:
 
       - name: Upload coverage
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: coverage-${{ matrix.target }}
           path: fuzz/coverage/${{ matrix.target }}
@@ -84,7 +102,7 @@ jobs:
 
       - name: Preserve crash artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}
