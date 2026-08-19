@@ -44,13 +44,15 @@ envvault policy grant-use
 envvault run -- ./my-app
 ```
 
-会自动创建 `.envvault/`（Unix 权限 `0700`）、`.envvault/vault` 和 `envvault.json`。
+会自动创建 `.envvault/`（Unix 权限 `0700`）、`.envvault/vault`、`envvault.json`，并确保 `.gitignore` 忽略 Vault 与 credential。
 
 | 命令 | 自动写入 `envvault.json` 的字段 |
 |---|---|
 | `init`（未指定 `--vault`） | `vault`、默认 profile / credential 路径 |
-| `identity register` | `credential_file`、`caller_id` |
-| `profile create` | `profile` |
+| `identity register` | 顶层 `credential_file`、`caller_id` |
+| `identity register --as backend` | `targets.backend` 的 `credential_file`、`caller_id`（不改顶层默认） |
+| `profile create` | 顶层 `profile` |
+| `profile create --as backend` | `targets.backend` 的 `profile` |
 
 只有「已有旧 Vault」或「想换默认文件名」时才需要手写。相对路径不能含 `..`，也不能写绝对路径。
 
@@ -63,7 +65,22 @@ envvault list
 envvault run -- ./my-app
 ```
 
-仍可用长参数覆盖默认值：
+一个项目多个程序时，用 `--as` 写到 `targets`，不要覆盖默认项：
+
+```bash
+envvault --as backend identity register --kind application --name backend
+envvault --as backend profile create DATABASE_URL JWT_SECRET
+envvault --as backend policy grant-use
+envvault --as backend run -- ./server
+
+envvault --as agent identity register --kind ai-agent --name coding-agent
+envvault --as agent profile create DATABASE_URL
+envvault --as agent policy grant-inspect
+```
+
+`--as` 只对 `identity register`、`profile create`、`policy grant-use` / `grant-inspect` / `revoke-use`、`run`、`session` 有效。目标名只能是字母、数字、`-`、`_`。
+
+仍可用长参数覆盖默认值或某个 target：
 
 ```bash
 envvault --vault ./.envvault/vault run \
@@ -77,6 +94,8 @@ envvault --vault ./.envvault/vault run \
 | 选项 | 作用 |
 |---|---|
 | `--vault <PATH>` | 指定 Vault；可省略，改用 `envvault.json` |
+| `--as <NAME>` | 选用 `targets.NAME`；不改顶层默认 |
+| `--format json` | 列表/预览类命令输出 JSON，不含 Value |
 | `--masked-input` | 输入时显示 `*`，会暴露长度；默认完全隐藏 |
 | `--help` / `-h` | 帮助 |
 | `--version` / `-V` | 版本 |
@@ -100,28 +119,33 @@ envvault init
 envvault --vault ./.envvault/vault init
 ```
 
-创建新的加密 Vault 和 Owner。不加 `--vault` 时在当前目录创建 `.envvault/vault` 并写入 `envvault.json`（已存在则不覆盖）。不能对已存在的 Vault 再 `init`。
+创建新的加密 Vault 和 Owner。不加 `--vault` 时在当前目录创建 `.envvault/vault`、写入 `envvault.json`（已存在则不覆盖），并确保 `.gitignore` 含 `.envvault/` 与 `*.credential.json`。已有 `.gitignore` 只追加缺的行，不覆盖你自己的规则。不能对已存在的 Vault 再 `init`。指定 `--vault` 时不写项目文件和 `.gitignore`。
 
 ### 4.2 Secret 管理
 
 ```bash
 envvault set TEST_TOKEN
 envvault list
+envvault list --verbose
 envvault exists TEST_TOKEN
 envvault verify TEST_TOKEN
+envvault rename OLD_NAME NEW_NAME
 envvault remove TEST_TOKEN
+envvault change-password
 ```
 
-名称在命令行，值只从终端读。新 Secret 自动给 Owner `list` / `exists` / `verify` / `write` / `delete`，不会自动给 `use`。程序要用，必须另外 `policy grant-use`。`remove` 不擦除磁盘旧块。
+名称在命令行，值只从终端读。新 Secret 自动给 Owner `list` / `exists` / `verify` / `write` / `delete`，不会自动给 `use`。程序要用，必须另外 `policy grant-use`。`list --verbose` 额外打印 SecretId 和被授了 `use` 的 caller（管理标签或 ID），不含 Value。`rename` 只改名称，SecretId 和值不变。`change-password` 先输当前 Master Password，再输两次新密码；会重加密整个 Vault，若开了 machine unlock 会尝试轮换包装。`remove` 不擦除磁盘旧块。
 
 ### 4.3 `import` / `example`
 
 ```bash
+envvault import --dry-run ./.env
 envvault import ./.env
 envvault example --output ./.env.example
+envvault example --profile ./.envvault/app.profile.json
 ```
 
-把严格 dotenv 拆成独立 Secret，或生成不含值的 `.env.example`。`import` 绝不修改、删除源 `.env`，成功时打印 `source_preserved: yes`。导入后明文仍在源文件里，必须自己删掉。
+把严格 dotenv 拆成独立 Secret，或生成不含值的 `.env.example`。默认 example 包含所有你能 `list` 的名字；`--profile` 或 `--as` 只输出该 Profile 里的环境变量键。`--dry-run` 只预览每条是 `create` / `replace` / `conflict`，不写 Vault、不改源文件。`conflict` 表示这个名字已存在但当前身份没有 `write`。真正 `import` 绝不修改、删除源 `.env`，成功时打印 `source_preserved: yes`。导入后明文仍在源文件里，必须自己删掉。`init` / `set` / `import` / `identity register` / `profile create` / `grant-use` 成功后会打一行 `next:`，提示下一步。
 
 ### 4.4 Identity
 
@@ -139,23 +163,29 @@ envvault identity revoke --caller-id <ID>
 ```bash
 envvault profile create TEST_TOKEN
 envvault policy grant-use
+envvault policy grant-inspect
+envvault policy list
+envvault policy revoke-use --secret OPENAI_API_KEY
 ```
 
-Profile 只是环境变量名到 SecretId 的请求清单，不授予权限。`grant-use` 才把 Profile 里每条 Secret 的 `use` 精确授予该 Caller。未授权就 `run` 会得到 `the requested Secret is unavailable`。
+Profile 只是环境变量名到 SecretId 的请求清单，不授予权限。`grant-use` 才把 Profile 里每条 Secret 的 `use` 精确授予该 Caller，之后 `run` 才能注入。`grant-inspect` 只授 `list` 和 `exists`，不授 `use`，适合 AI Agent 查看名字而不拿值。`policy list` 打印当前规则（caller、名字、操作、allow/deny），不含 Secret 值；有 `list` 权限的 Secret 显示名称，否则只显示 SecretId。`revoke-use` 只收回 `use`：给了 `--secret` 就按名称收，否则按 Profile（或 `envvault.json` 默认 Profile）整批收。身份和其它授权都还在。未授权就 `run` 会得到 `the requested Secret is unavailable`。
 
 ### 4.6 `run`
 
 ```bash
 envvault run -- ./my-app
+envvault run --dry-run
 envvault run --machine-unlock -- ./my-app
+envvault completions bash
 ```
 
-`--` 后面是精确 argv，不经过 shell。会清空父进程环境。Linux 只保留 `PATH`、`HOME`、`TMPDIR`、`LANG`、`CARGO_HOME`、`RUSTUP_HOME`，再加上授权过的变量。子程序只读环境变量，不要读 Vault 或 credential。`run` 不是沙箱。
+`--` 后面是精确 argv，不经过 shell。会清空父进程环境。Linux 只保留 `PATH`、`HOME`、`TMPDIR`、`LANG`、`CARGO_HOME`、`RUSTUP_HOME`，再加上授权过的变量。子程序只读环境变量，不要读 Vault 或 credential。`run --dry-run` 只打印每个环境变量键会是 `inject` / `deny` / `missing`，不启动程序、不解密 Value。未授权是 `the caller is not authorized...`，Profile 里的 Secret 已删除是 `not present in the Vault`，credential 过期是 `caller credential has expired`。`run` 不是沙箱。`completions` 打印 bash/zsh/powershell 补全脚本，不列举 Secret 名。
 
 ### 4.7 Audit / Keystore / Session
 
 ```bash
 envvault audit list
+envvault audit list --secret DATABASE_URL --operation use
 envvault audit migrate-v2
 envvault audit serve-anchor --data-dir /var/lib/envvault-anchor \
   --tls-cert /var/lib/envvault-anchor/cert.pem \
@@ -198,7 +228,7 @@ envvault uninstall --purge-project
 | 上游服务颁发的密钥 | 由对方决定 | 撤销或轮换后需再 `set` |
 | Vault 里的 Secret | 不过期 | 直到 `set` 覆盖或 `remove` |
 | Application credential | 严格 90 天 | 到期 `identity rotate`，Policy 可保留 |
-| `grant-use` | 不自动消失 | `revoke` 或改 Policy 才会没 |
+| `grant-use` | 不自动消失 | `policy revoke-use` 收回单条；`identity revoke` 废掉整个身份 |
 | Master Password | 不过期 | 每次命令或 machine-unlock 时使用 |
 
 ## 6. 产出文件

@@ -15,6 +15,14 @@ pub(super) struct Cli {
     #[arg(long, global = true)]
     pub(super) masked_input: bool,
 
+    /// Named target from `envvault.json` (`targets.<name>`).
+    #[arg(long = "as", global = true, value_name = "NAME")]
+    pub(super) target: Option<String>,
+
+    /// Machine-readable value-free output for listing and preview commands.
+    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text)]
+    pub(super) format: OutputFormat,
+
     #[command(subcommand)]
     pub(super) command: Command,
 }
@@ -33,8 +41,12 @@ pub(super) enum Command {
         /// Secret name to verify.
         name: String,
     },
-    /// List only the Secret names authorized for the Owner.
-    List,
+    /// List authorized Secret names; `--verbose` adds `SecretId` and `use` grants.
+    List {
+        /// Include `SecretId` and callers granted `use`.
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Check an authorized Secret name without revealing its value.
     Exists {
         /// Secret name to check.
@@ -45,16 +57,31 @@ pub(super) enum Command {
         /// Secret name to remove.
         name: String,
     },
+    /// Rename a Secret without changing its `SecretId` or value.
+    Rename {
+        /// Current Secret name.
+        current: String,
+        /// New Secret name.
+        new: String,
+    },
+    /// Replace the Master Password and re-encrypt the Vault.
+    ChangePassword,
     /// Import a strict dotenv file as independently managed Secrets.
     Import {
         /// Existing dotenv source; it is never modified or deleted.
         source: PathBuf,
+        /// Preview create/replace/conflict without writing the Vault.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Generate a new value-free dotenv example from authorized names.
     Example {
         /// New output file; an existing path is never overwritten.
         #[arg(long, default_value = ".env.example", value_name = "PATH")]
         output: PathBuf,
+        /// Restrict the example to environment keys in this Profile.
+        #[arg(long, value_name = "PATH")]
+        profile: Option<PathBuf>,
     },
     /// Manage authenticated application and AI-agent identities.
     Identity {
@@ -66,7 +93,7 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: ProfileCommand,
     },
-    /// Manage exact runtime-use grants as the Vault Owner.
+    /// Inspect and update exact per-Secret authorization rules.
     Policy {
         #[command(subcommand)]
         command: PolicyCommand,
@@ -103,9 +130,17 @@ pub(super) enum Command {
         /// Unlock through the OS credential store without a Master Password prompt.
         #[arg(long)]
         machine_unlock: bool,
+        /// Preview inject/deny/missing keys without starting the program.
+        #[arg(long)]
+        dry_run: bool,
         /// Exact program and arguments following `--`; no shell is introduced.
-        #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
+    },
+    /// Print shell completion script to stdout.
+    Completions {
+        /// Shell to generate completions for.
+        shell: CompletionShell,
     },
     /// Remove the installed `envvault` binary. Vaults are kept unless `--purge-project`.
     Uninstall {
@@ -136,7 +171,17 @@ pub(super) enum KeystoreCommand {
 #[derive(Debug, Subcommand)]
 pub(super) enum AuditCommand {
     /// List value-free Audit events after exact Owner authorization.
-    List,
+    List {
+        /// Restrict to this caller identifier.
+        #[arg(long)]
+        caller_id: Option<CallerId>,
+        /// Restrict to this Secret name (resolved after `list` authorization).
+        #[arg(long)]
+        secret: Option<String>,
+        /// Restrict to this operation code, such as `use` or `list`.
+        #[arg(long)]
+        operation: Option<String>,
+    },
     /// Explicitly migrate a legacy Vault Audit chain to the V2 sidecar backend.
     MigrateV2,
     /// Run a loopback ADR 0015 CAS service in an independent data directory.
@@ -227,6 +272,8 @@ pub(super) enum ProfileCommand {
 
 #[derive(Debug, Subcommand)]
 pub(super) enum PolicyCommand {
+    /// List persisted per-Secret rules without Secret Values.
+    List,
     /// Grant exact `use` permission for every `SecretId` in a Profile.
     GrantUse {
         /// Registered Application or AI Agent caller receiving the grants.
@@ -236,12 +283,49 @@ pub(super) enum PolicyCommand {
         #[arg(long, value_name = "PATH")]
         profile: Option<PathBuf>,
     },
+    /// Grant exact `list` and `exists` permission for every `SecretId` in a Profile.
+    GrantInspect {
+        /// Registered Application or AI Agent caller receiving the grants.
+        #[arg(long)]
+        caller_id: Option<CallerId>,
+        /// Strict value-free Profile whose exact `SecretIds` are granted.
+        #[arg(long, value_name = "PATH")]
+        profile: Option<PathBuf>,
+    },
+    /// Remove exact `use` grants for Profile secrets and/or named Secrets.
+    RevokeUse {
+        /// Registered Application or AI Agent caller losing the grants.
+        #[arg(long)]
+        caller_id: Option<CallerId>,
+        /// Strict value-free Profile whose exact `SecretIds` lose `use`.
+        #[arg(long, value_name = "PATH")]
+        profile: Option<PathBuf>,
+        /// Secret name whose `use` grant is removed. Repeatable.
+        #[arg(long = "secret", value_name = "NAME")]
+        secrets: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(super) enum CallerKindArg {
     Application,
     AiAgent,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(super) enum CompletionShell {
+    Bash,
+    Zsh,
+    Powershell,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub(super) enum OutputFormat {
+    /// Human-readable text.
+    #[default]
+    Text,
+    /// Compact JSON without Secret Values.
+    Json,
 }
 
 impl From<CallerKindArg> for CallerKind {
@@ -257,7 +341,7 @@ impl From<CallerKindArg> for CallerKind {
 mod tests {
     use clap::Parser as _;
 
-    use super::{AuditCommand, Cli, Command, IdentityCommand, SessionCommand};
+    use super::{AuditCommand, Cli, Command, IdentityCommand, PolicyCommand, SessionCommand};
 
     #[test]
     fn parses_identity_registration_without_secret_arguments() {
@@ -312,6 +396,69 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_global_as_target() {
+        let cli = Cli::try_parse_from(["envvault", "--as", "backend", "run", "--", "./app"]);
+        assert!(matches!(
+            cli,
+            Ok(Cli {
+                target: Some(name),
+                command: Command::Run { .. },
+                ..
+            }) if name == "backend"
+        ));
+    }
+
+    #[test]
+    fn parses_import_dry_run_without_secret_values() {
+        let cli = Cli::try_parse_from(["envvault", "import", "--dry-run", "./.env"]);
+        assert!(matches!(
+            cli.map(|value| value.command),
+            Ok(Command::Import { dry_run: true, .. })
+        ));
+    }
+
+    #[test]
+    fn parses_policy_inspect_and_revoke_without_secret_values() {
+        let inspect = Cli::try_parse_from([
+            "envvault",
+            "policy",
+            "grant-inspect",
+            "--caller-id",
+            "00000000-0000-0000-0000-000000000001",
+            "--profile",
+            "agent.profile.json",
+        ]);
+        assert!(matches!(
+            inspect.map(|value| value.command),
+            Ok(Command::Policy {
+                command: PolicyCommand::GrantInspect { .. }
+            })
+        ));
+
+        let revoke = Cli::try_parse_from([
+            "envvault",
+            "policy",
+            "revoke-use",
+            "--secret",
+            "OPENAI_API_KEY",
+        ]);
+        assert!(matches!(
+            revoke.map(|value| value.command),
+            Ok(Command::Policy {
+                command: PolicyCommand::RevokeUse { .. }
+            })
+        ));
+
+        let list = Cli::try_parse_from(["envvault", "policy", "list"]);
+        assert!(matches!(
+            list.map(|value| value.command),
+            Ok(Command::Policy {
+                command: PolicyCommand::List
+            })
+        ));
     }
 
     #[test]

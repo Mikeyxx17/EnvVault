@@ -5,6 +5,7 @@
 mod application;
 mod args;
 mod commands;
+mod completions;
 mod credential_file;
 mod credential_recovery;
 mod dotenv_file;

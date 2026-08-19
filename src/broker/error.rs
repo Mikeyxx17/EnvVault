@@ -13,6 +13,8 @@ pub enum BrokerError {
     AuditMigrationInvalid,
     /// Owner identity bootstrap or authenticated identity loading failed.
     IdentityUnavailable,
+    /// The caller credential matched but its bounded lifetime has ended.
+    CredentialExpired,
     /// A proposed Policy document violated format or resource invariants.
     PolicyUpdateInvalid,
     /// A proposed Identity Registry change violated an invariant.
@@ -32,6 +34,7 @@ impl fmt::Display for BrokerError {
                 formatter.write_str("Audit V2 migration is invalid or already completed")
             }
             Self::IdentityUnavailable => formatter.write_str("caller identity is unavailable"),
+            Self::CredentialExpired => formatter.write_str("caller credential has expired"),
             Self::PolicyUpdateInvalid => formatter.write_str("the Policy update is invalid"),
             Self::IdentityUpdateInvalid => {
                 formatter.write_str("the Identity Registry update is invalid")

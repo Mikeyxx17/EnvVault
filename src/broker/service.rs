@@ -93,6 +93,147 @@ impl SecretUseResult {
     }
 }
 
+/// Value-free listing of one persisted per-Secret authorization rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PolicyRuleListing {
+    caller: Caller,
+    caller_name: Option<CallerName>,
+    secret_id: SecretId,
+    secret_name: Option<SecretName>,
+    operation: Operation,
+    effect: PolicyEffect,
+}
+
+impl PolicyRuleListing {
+    /// Returns the exact policy subject.
+    #[must_use]
+    pub(crate) const fn caller(&self) -> Caller {
+        self.caller
+    }
+
+    /// Returns the registered management label, when the subject is registered.
+    #[must_use]
+    pub(crate) fn caller_name(&self) -> Option<&CallerName> {
+        self.caller_name.as_ref()
+    }
+
+    /// Returns the exact Secret targeted by the rule.
+    #[must_use]
+    pub(crate) const fn secret_id(&self) -> SecretId {
+        self.secret_id
+    }
+
+    /// Returns the Secret name only when the actor has `list` on that Secret.
+    #[must_use]
+    pub(crate) fn secret_name(&self) -> Option<&SecretName> {
+        self.secret_name.as_ref()
+    }
+
+    /// Returns the exact operation targeted by the rule.
+    #[must_use]
+    pub(crate) const fn operation(&self) -> Operation {
+        self.operation
+    }
+
+    /// Returns whether the rule allows or denies its exact tuple.
+    #[must_use]
+    pub(crate) const fn effect(&self) -> PolicyEffect {
+        self.effect
+    }
+}
+
+/// Planned action for one dotenv key during import, without Secret Values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImportPlanAction {
+    /// The name is not a writable existing Secret and would be created.
+    Create,
+    /// The name exists and the actor has `write`.
+    Replace,
+    /// The name exists, is visible via `exists`, and is not writable.
+    Conflict,
+}
+
+impl ImportPlanAction {
+    /// Returns the stable CLI token for this action.
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Replace => "replace",
+            Self::Conflict => "conflict",
+        }
+    }
+}
+
+/// Value-free import preview for one dotenv key.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ImportPlanItem {
+    name: SecretName,
+    action: ImportPlanAction,
+}
+
+impl ImportPlanItem {
+    /// Returns the dotenv key / Secret name.
+    #[must_use]
+    pub(crate) const fn name(&self) -> &SecretName {
+        &self.name
+    }
+
+    /// Returns whether the key would be created, replaced, or rejected.
+    #[must_use]
+    pub(crate) const fn action(&self) -> ImportPlanAction {
+        self.action
+    }
+}
+
+struct ImportNameClasses {
+    writable: BTreeMap<SecretName, SecretId>,
+    conflicting: BTreeSet<SecretName>,
+}
+
+/// Value-free preview of one Profile `use` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UsePreview {
+    secret_id: SecretId,
+    outcome: UsePreviewOutcome,
+}
+
+impl UsePreview {
+    /// Returns the Profile `SecretId` being previewed.
+    #[must_use]
+    pub(crate) const fn secret_id(self) -> SecretId {
+        self.secret_id
+    }
+
+    /// Returns whether the Secret would be injected, denied, or is missing.
+    #[must_use]
+    pub(crate) const fn outcome(self) -> UsePreviewOutcome {
+        self.outcome
+    }
+}
+
+/// Whether a Profile Secret would be injected, denied, or is missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UsePreviewOutcome {
+    /// Policy Allow and the Secret still exists.
+    Inject,
+    /// Policy Deny.
+    Deny,
+    /// The Profile `SecretId` is not present in the Vault.
+    Missing,
+}
+
+impl UsePreviewOutcome {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inject => "inject",
+            Self::Deny => "deny",
+            Self::Missing => "missing",
+        }
+    }
+}
+
 /// Internal Secret Broker that enforces Identity, Policy, Audit, then Vault.
 pub(crate) struct SecretBroker<A> {
     vault: FileVault,
@@ -541,20 +682,17 @@ impl<A: AuditSink> SecretBroker<A> {
         let effective_unix_time_millis = candidate.last_observed_authentication_time();
         let credential_is_active =
             candidate.credential_is_active(caller_id, kind, effective_unix_time_millis);
-        let authenticated = if disposition == AuthenticationDisposition::Blocked {
-            false
-        } else {
-            let stored = self.identities.credential(caller_id, kind);
-            let (config, expected) = stored.map_or_else(dummy_credential_verifier, |verifier| {
-                (credential_kdf_config(verifier), *verifier.verifier())
-            });
-            let derived =
-                derive_key_material(credential.expose_secret(), config, KdfLimits::default())
-                    .map_err(|_| BrokerError::IdentityUnavailable)?;
-            bool::from(derived.as_slice().ct_eq(expected.as_slice()))
-                && stored.is_some()
-                && credential_is_active
-        };
+        let stored = self.identities.credential(caller_id, kind);
+        let (config, expected) = stored.map_or_else(dummy_credential_verifier, |verifier| {
+            (credential_kdf_config(verifier), *verifier.verifier())
+        });
+        let derived = derive_key_material(credential.expose_secret(), config, KdfLimits::default())
+            .map_err(|_| BrokerError::IdentityUnavailable)?;
+        let secret_matches =
+            bool::from(derived.as_slice().ct_eq(expected.as_slice())) && stored.is_some();
+        let authenticated = secret_matches
+            && credential_is_active
+            && disposition != AuthenticationDisposition::Blocked;
         let decision = if authenticated {
             PolicyDecision::Allow
         } else {
@@ -573,10 +711,16 @@ impl<A: AuditSink> SecretBroker<A> {
         );
         persist_authentication_throttle(&mut self.vault, &mut candidate)?;
         self.identities = candidate;
-        if !authenticated {
-            return Err(BrokerError::IdentityUnavailable);
+        if authenticated {
+            return Ok(VerifiedCaller::new(caller, method));
         }
-        Ok(VerifiedCaller::new(caller, method))
+        if secret_matches
+            && !credential_is_active
+            && disposition != AuthenticationDisposition::Blocked
+        {
+            return Err(BrokerError::CredentialExpired);
+        }
+        Err(BrokerError::IdentityUnavailable)
     }
 
     pub(crate) fn registered_callers(
@@ -680,6 +824,43 @@ impl<A: AuditSink> SecretBroker<A> {
         Ok(record)
     }
 
+    pub(crate) fn plan_import(
+        &mut self,
+        caller: &VerifiedCaller,
+        names: &[SecretName],
+    ) -> Result<Vec<ImportPlanItem>, BrokerError> {
+        let mut input_names = BTreeSet::new();
+        for name in names {
+            if !input_names.insert(name.clone()) {
+                return Err(BrokerError::PolicyUpdateInvalid);
+            }
+        }
+        let classes = self.classify_import_names(caller, &input_names)?;
+        let create_count = names
+            .iter()
+            .filter(|name| {
+                !classes.writable.contains_key(*name) && !classes.conflicting.contains(*name)
+            })
+            .count();
+        if create_count > 0 {
+            self.require_vault_allow(caller, VaultOperation::CreateSecret)?;
+            self.require_vault_allow(caller, VaultOperation::ManagePolicy)?;
+        }
+        Ok(names
+            .iter()
+            .map(|name| ImportPlanItem {
+                name: name.clone(),
+                action: if classes.writable.contains_key(name) {
+                    ImportPlanAction::Replace
+                } else if classes.conflicting.contains(name) {
+                    ImportPlanAction::Conflict
+                } else {
+                    ImportPlanAction::Create
+                },
+            })
+            .collect())
+    }
+
     pub(crate) fn import_managed_secrets(
         &mut self,
         caller: &VerifiedCaller,
@@ -695,16 +876,14 @@ impl<A: AuditSink> SecretBroker<A> {
             }
         }
 
-        let mut writable = BTreeMap::new();
-        for secret_id in self.vault.secret_ids() {
-            if self
-                .authorize(caller, secret_id, Operation::Write)?
-                .is_allowed()
-            {
-                let record = self.vault.record(secret_id)?;
-                writable.insert(record.name().clone(), record.id());
-            }
+        let classes = self.classify_import_names(caller, &input_names)?;
+        if entries
+            .iter()
+            .any(|(name, _)| classes.conflicting.contains(name))
+        {
+            return Err(BrokerError::Vault(VaultError::AlreadyExists));
         }
+        let writable = classes.writable;
         let new_count = entries
             .iter()
             .filter(|(name, _)| !writable.contains_key(name))
@@ -783,6 +962,41 @@ impl<A: AuditSink> SecretBroker<A> {
             self.policy = PolicyEngine::from_document_result(Ok(Some(document)));
         }
         Ok(records)
+    }
+
+    fn classify_import_names(
+        &mut self,
+        caller: &VerifiedCaller,
+        names: &BTreeSet<SecretName>,
+    ) -> Result<ImportNameClasses, BrokerError> {
+        let mut writable = BTreeMap::new();
+        let mut conflicting = BTreeSet::new();
+        for secret_id in self.vault.secret_ids() {
+            if self
+                .authorize(caller, secret_id, Operation::Write)?
+                .is_allowed()
+            {
+                let record = self.vault.record(secret_id)?;
+                writable.insert(record.name().clone(), record.id());
+                continue;
+            }
+            if names.is_empty() {
+                continue;
+            }
+            if self
+                .authorize(caller, secret_id, Operation::Exists)?
+                .is_allowed()
+            {
+                let record = self.vault.record(secret_id)?;
+                if names.contains(record.name()) {
+                    conflicting.insert(record.name().clone());
+                }
+            }
+        }
+        Ok(ImportNameClasses {
+            writable,
+            conflicting,
+        })
     }
 
     pub(crate) fn replace_secret(
@@ -1017,17 +1231,132 @@ impl<A: AuditSink> SecretBroker<A> {
         caller_id: CallerId,
         secret_ids: &[SecretId],
     ) -> Result<u64, BrokerError> {
-        if secret_ids.is_empty() {
+        self.grant_exact_allows(actor, caller_id, secret_ids, &[Operation::Use])
+    }
+
+    pub(crate) fn grant_profile_inspect(
+        &mut self,
+        actor: &VerifiedCaller,
+        caller_id: CallerId,
+        secret_ids: &[SecretId],
+    ) -> Result<u64, BrokerError> {
+        self.grant_exact_allows(
+            actor,
+            caller_id,
+            secret_ids,
+            &[Operation::List, Operation::Exists],
+        )
+    }
+
+    pub(crate) fn revoke_profile_use(
+        &mut self,
+        actor: &VerifiedCaller,
+        caller_id: CallerId,
+        secret_ids: &[SecretId],
+    ) -> Result<u64, BrokerError> {
+        self.revoke_exact_allows(actor, caller_id, secret_ids, &[Operation::Use])
+    }
+
+    pub(crate) fn list_policy_rules(
+        &mut self,
+        actor: &VerifiedCaller,
+    ) -> Result<(u64, Vec<PolicyRuleListing>), BrokerError> {
+        self.require_vault_allow(actor, VaultOperation::ManagePolicy)?;
+        let (generation, payload) = self.vault.policy_payload()?;
+        let document =
+            PolicyDocument::decode(&payload).map_err(|_| BrokerError::PolicyUpdateInvalid)?;
+        if document.generation() != generation {
             return Err(BrokerError::PolicyUpdateInvalid);
         }
-        let subject = self
+
+        let unique_secret_ids = document
+            .policy()
+            .rules()
+            .map(|rule| rule.secret_id())
+            .collect::<BTreeSet<_>>();
+        let mut visible_names = BTreeMap::new();
+        for secret_id in unique_secret_ids {
+            if self
+                .authorize(actor, secret_id, Operation::List)?
+                .is_allowed()
+                && self.vault.contains_secret(secret_id)
+            {
+                visible_names.insert(secret_id, self.vault.record(secret_id)?.name().clone());
+            }
+        }
+        let caller_names = self
             .identities
+            .callers()
+            .into_iter()
+            .map(|registered| (registered.caller().id(), registered.name().clone()))
+            .collect::<BTreeMap<_, _>>();
+
+        let listings = document
+            .policy()
+            .rules()
+            .map(|rule| PolicyRuleListing {
+                caller: rule.caller(),
+                caller_name: caller_names.get(&rule.caller_id()).cloned(),
+                secret_id: rule.secret_id(),
+                secret_name: visible_names.get(&rule.secret_id()).cloned(),
+                operation: rule.operation(),
+                effect: rule.effect(),
+            })
+            .collect();
+        Ok((generation, listings))
+    }
+
+    /// Returns value-free `use` Allow labels for verbose Secret listings.
+    pub(crate) fn use_grant_labels(
+        &mut self,
+        actor: &VerifiedCaller,
+    ) -> Result<Vec<(SecretId, String)>, BrokerError> {
+        self.require_vault_allow(actor, VaultOperation::ManagePolicy)?;
+        let (generation, payload) = self.vault.policy_payload()?;
+        let document =
+            PolicyDocument::decode(&payload).map_err(|_| BrokerError::PolicyUpdateInvalid)?;
+        if document.generation() != generation {
+            return Err(BrokerError::PolicyUpdateInvalid);
+        }
+        let caller_names = self
+            .identities
+            .callers()
+            .into_iter()
+            .map(|registered| (registered.caller().id(), registered.name().clone()))
+            .collect::<BTreeMap<_, _>>();
+        Ok(document
+            .policy()
+            .rules()
+            .filter(|rule| {
+                rule.operation() == Operation::Use && rule.effect() == PolicyEffect::Allow
+            })
+            .map(|rule| {
+                let label = caller_names.get(&rule.caller_id()).map_or_else(
+                    || rule.caller_id().to_string(),
+                    |name| name.as_str().to_owned(),
+                );
+                (rule.secret_id(), label)
+            })
+            .collect())
+    }
+
+    fn registered_subject(&self, caller_id: CallerId) -> Result<Caller, BrokerError> {
+        self.identities
             .callers()
             .into_iter()
             .find(|registered| registered.caller().id() == caller_id)
             .map(|registered| registered.caller())
-            .ok_or(BrokerError::IdentityUpdateInvalid)?;
+            .ok_or(BrokerError::IdentityUpdateInvalid)
+    }
 
+    fn load_current_secret_policy(
+        &mut self,
+        actor: &VerifiedCaller,
+        secret_ids: &[SecretId],
+    ) -> Result<(u64, PolicySet, VaultPolicySet), BrokerError> {
+        if secret_ids.is_empty() {
+            return Err(BrokerError::PolicyUpdateInvalid);
+        }
         self.require_vault_allow(actor, VaultOperation::ManagePolicy)?;
         for secret_id in secret_ids {
             self.require_allow(actor, *secret_id, Operation::Exists)?;
@@ -1035,38 +1364,22 @@ impl<A: AuditSink> SecretBroker<A> {
                 return Err(BrokerError::PolicyUpdateInvalid);
             }
         }
-
         let (expected_generation, payload) = self.vault.policy_payload()?;
         let current =
             PolicyDocument::decode(&payload).map_err(|_| BrokerError::PolicyUpdateInvalid)?;
         if current.generation() != expected_generation {
             return Err(BrokerError::PolicyUpdateInvalid);
         }
-        let (mut secret_policy, vault_policy) = current.into_policies();
-        for secret_id in secret_ids {
-            let has_explicit_deny = secret_policy.rules().any(|rule| {
-                rule.caller() == subject
-                    && rule.secret_id() == *secret_id
-                    && rule.operation() == Operation::Use
-                    && rule.effect() == PolicyEffect::Deny
-            });
-            if has_explicit_deny {
-                return Err(BrokerError::PolicyUpdateInvalid);
-            }
-        }
-        let mut changed = false;
-        for secret_id in secret_ids {
-            changed |= secret_policy.insert(PolicyRule::new(
-                subject,
-                *secret_id,
-                Operation::Use,
-                PolicyEffect::Allow,
-            ));
-        }
-        if !changed {
-            return Ok(expected_generation);
-        }
+        let (secret_policy, vault_policy) = current.into_policies();
+        Ok((expected_generation, secret_policy, vault_policy))
+    }
 
+    fn commit_secret_policy(
+        &mut self,
+        expected_generation: u64,
+        secret_policy: PolicySet,
+        vault_policy: VaultPolicySet,
+    ) -> Result<u64, BrokerError> {
         let new_generation = expected_generation
             .checked_add(1)
             .ok_or(BrokerError::PolicyUpdateInvalid)?;
@@ -1084,6 +1397,149 @@ impl<A: AuditSink> SecretBroker<A> {
         }
         self.policy = PolicyEngine::from_document_result(Ok(Some(document)));
         Ok(committed)
+    }
+
+    fn grant_exact_allows(
+        &mut self,
+        actor: &VerifiedCaller,
+        caller_id: CallerId,
+        secret_ids: &[SecretId],
+        operations: &[Operation],
+    ) -> Result<u64, BrokerError> {
+        if operations.is_empty() {
+            return Err(BrokerError::PolicyUpdateInvalid);
+        }
+        let subject = self.registered_subject(caller_id)?;
+        let (expected_generation, mut secret_policy, vault_policy) =
+            self.load_current_secret_policy(actor, secret_ids)?;
+        for secret_id in secret_ids {
+            for operation in operations {
+                let has_explicit_deny = secret_policy.rules().any(|rule| {
+                    rule.caller() == subject
+                        && rule.secret_id() == *secret_id
+                        && rule.operation() == *operation
+                        && rule.effect() == PolicyEffect::Deny
+                });
+                if has_explicit_deny {
+                    return Err(BrokerError::PolicyUpdateInvalid);
+                }
+            }
+        }
+        let mut changed = false;
+        for secret_id in secret_ids {
+            for operation in operations {
+                changed |= secret_policy.insert(PolicyRule::new(
+                    subject,
+                    *secret_id,
+                    *operation,
+                    PolicyEffect::Allow,
+                ));
+            }
+        }
+        if !changed {
+            return Ok(expected_generation);
+        }
+        self.commit_secret_policy(expected_generation, secret_policy, vault_policy)
+    }
+
+    fn revoke_exact_allows(
+        &mut self,
+        actor: &VerifiedCaller,
+        caller_id: CallerId,
+        secret_ids: &[SecretId],
+        operations: &[Operation],
+    ) -> Result<u64, BrokerError> {
+        if operations.is_empty() {
+            return Err(BrokerError::PolicyUpdateInvalid);
+        }
+        let subject = self.registered_subject(caller_id)?;
+        let (expected_generation, mut secret_policy, vault_policy) =
+            self.load_current_secret_policy(actor, secret_ids)?;
+        let mut changed = false;
+        for secret_id in secret_ids {
+            for operation in operations {
+                changed |= secret_policy.remove(&PolicyRule::new(
+                    subject,
+                    *secret_id,
+                    *operation,
+                    PolicyEffect::Allow,
+                ));
+            }
+        }
+        if !changed {
+            return Ok(expected_generation);
+        }
+        self.commit_secret_policy(expected_generation, secret_policy, vault_policy)
+    }
+
+    pub(crate) fn change_password(
+        &mut self,
+        actor: &VerifiedCaller,
+        new_password: &MasterPassword,
+    ) -> Result<(), BrokerError> {
+        if actor.caller() != self.identities.verified_owner().caller() {
+            return Err(BrokerError::AccessDenied(DenyReason::NoMatchingGrant));
+        }
+        self.vault.change_password(new_password)?;
+        match keystore::rotate(
+            self.vault.path(),
+            self.vault.vault_id(),
+            self.vault.master_key(),
+        ) {
+            Ok(_) | Err(crate::keystore::KeystoreError::NotEnabled) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(crate) fn rename_secret_by_name(
+        &mut self,
+        caller: &VerifiedCaller,
+        current: &SecretName,
+        new_name: SecretName,
+    ) -> Result<SecretRecord, BrokerError> {
+        for secret_id in self.vault.secret_ids() {
+            let decision = self.authorize(caller, secret_id, Operation::Write)?;
+            if decision.is_allowed() {
+                let record = self.vault.record(secret_id)?;
+                if record.name() == current {
+                    if record.name() == &new_name {
+                        return Ok(record);
+                    }
+                    let value = self.vault.read_secret(secret_id)?;
+                    return self
+                        .vault
+                        .replace_secret(secret_id, new_name, &value)
+                        .map_err(Into::into);
+                }
+            }
+        }
+        Err(BrokerError::AccessDenied(DenyReason::NoMatchingGrant))
+    }
+
+    pub(crate) fn preview_use(
+        &mut self,
+        caller: &VerifiedCaller,
+        secret_ids: impl IntoIterator<Item = SecretId>,
+    ) -> Result<Vec<UsePreview>, BrokerError> {
+        let mut previews = Vec::new();
+        for secret_id in secret_ids {
+            let present = self.vault.contains_secret(secret_id);
+            let decision = self.authorize(caller, secret_id, Operation::Use)?;
+            let outcome = if !present {
+                UsePreviewOutcome::Missing
+            } else if decision.is_allowed() {
+                UsePreviewOutcome::Inject
+            } else {
+                UsePreviewOutcome::Deny
+            };
+            previews.push(UsePreview { secret_id, outcome });
+        }
+        Ok(previews)
+    }
+
+    /// Returns whether this `SecretId` currently exists in the Vault.
+    pub(crate) fn contains_secret(&self, secret_id: SecretId) -> bool {
+        self.vault.contains_secret(secret_id)
     }
 
     pub(crate) fn list(
@@ -2229,6 +2685,134 @@ mod tests {
     }
 
     #[test]
+    fn inspect_grant_allows_list_and_exists_but_not_use() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempdir()?;
+        let path = directory.path().join("vault.json");
+        let (mut broker, owner) =
+            SecretBroker::bootstrap_owner(&path, &password(), MemoryAudit::default())?;
+        let secret = broker.create_managed_secret(
+            &owner,
+            SecretName::new("DATABASE_URL")?,
+            &SecretValue::new(b"postgres://inspect-test".to_vec()),
+        )?;
+        let issued = broker.register_caller(
+            &owner,
+            CallerKind::AiAgent,
+            CallerName::new("inspect-agent")?,
+        )?;
+        let agent = issued.caller();
+        let credential = issued.into_credential();
+        let agent_identity = broker.authenticate_caller(agent.id(), agent.kind(), &credential)?;
+
+        let generation = broker.grant_profile_inspect(&owner, agent.id(), &[secret.id()])?;
+        assert_eq!(
+            broker.grant_profile_inspect(&owner, agent.id(), &[secret.id()])?,
+            generation
+        );
+
+        let listed = broker.list(&agent_identity)?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name().as_str(), "DATABASE_URL");
+        assert!(broker.exists(&agent_identity, secret.id())?);
+        assert!(matches!(
+            broker.use_secret(&agent_identity, secret.id()),
+            Err(BrokerError::AccessDenied(DenyReason::NoMatchingGrant))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn revoke_use_removes_only_the_use_grant() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("vault.json");
+        let (mut broker, owner) =
+            SecretBroker::bootstrap_owner(&path, &password(), MemoryAudit::default())?;
+        let first = broker.create_managed_secret(
+            &owner,
+            SecretName::new("DATABASE_URL")?,
+            &SecretValue::new(b"postgres://revoke-test".to_vec()),
+        )?;
+        let second = broker.create_managed_secret(
+            &owner,
+            SecretName::new("JWT_SECRET")?,
+            &SecretValue::new(b"jwt-revoke-test".to_vec()),
+        )?;
+        let issued = broker.register_caller(
+            &owner,
+            CallerKind::Application,
+            CallerName::new("revoke-backend")?,
+        )?;
+        let application = issued.caller();
+        let credential = issued.into_credential();
+        let application_identity =
+            broker.authenticate_caller(application.id(), application.kind(), &credential)?;
+
+        broker.grant_profile_use(&owner, application.id(), &[first.id(), second.id()])?;
+        broker.grant_profile_inspect(&owner, application.id(), &[first.id()])?;
+        let generation = broker.revoke_profile_use(&owner, application.id(), &[first.id()])?;
+        assert_eq!(
+            broker.revoke_profile_use(&owner, application.id(), &[first.id()])?,
+            generation
+        );
+
+        assert!(matches!(
+            broker.use_secret(&application_identity, first.id()),
+            Err(BrokerError::AccessDenied(DenyReason::NoMatchingGrant))
+        ));
+        assert_eq!(
+            broker
+                .use_secret(&application_identity, second.id())?
+                .expose_secret(),
+            b"jwt-revoke-test"
+        );
+        assert!(broker.exists(&application_identity, first.id())?);
+        Ok(())
+    }
+
+    #[test]
+    fn policy_listing_is_value_free_and_resolves_authorized_names()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("vault.json");
+        let (mut broker, owner) =
+            SecretBroker::bootstrap_owner(&path, &password(), MemoryAudit::default())?;
+        let secret = broker.create_managed_secret(
+            &owner,
+            SecretName::new("DATABASE_URL")?,
+            &SecretValue::new(b"postgres://list-policy-test".to_vec()),
+        )?;
+        let issued = broker.register_caller(
+            &owner,
+            CallerKind::Application,
+            CallerName::new("list-backend")?,
+        )?;
+        broker.grant_profile_use(&owner, issued.caller().id(), &[secret.id()])?;
+
+        let (generation, listings) = broker.list_policy_rules(&owner)?;
+        assert!(generation >= 1);
+        let use_grant = listings
+            .iter()
+            .find(|listing| {
+                listing.caller().id() == issued.caller().id()
+                    && listing.operation() == Operation::Use
+                    && listing.effect() == PolicyEffect::Allow
+            })
+            .ok_or("missing use grant")?;
+        assert_eq!(
+            use_grant.caller_name().map(CallerName::as_str),
+            Some("list-backend")
+        );
+        assert_eq!(
+            use_grant.secret_name().map(SecretName::as_str),
+            Some("DATABASE_URL")
+        );
+        let rendered = format!("{listings:?}");
+        assert!(!rendered.contains("postgres://list-policy-test"));
+        Ok(())
+    }
+
+    #[test]
     fn audit_read_requires_its_own_vault_permission() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let path = directory.path().join("vault.json");
@@ -2359,7 +2943,7 @@ mod tests {
             assert!(matches!(
                 broker
                     .authenticate_caller_at(caller.id(), caller.kind(), issued.credential(), now,),
-                Err(BrokerError::IdentityUnavailable)
+                Err(BrokerError::CredentialExpired)
             ));
         }
 
@@ -2434,6 +3018,53 @@ mod tests {
                 .all(|event| { event.caller() == caller && event.decision().is_denied() })
         );
         assert!(authentication_events[7].decision().is_allowed());
+        Ok(())
+    }
+
+    #[test]
+    fn clock_jump_expires_credentials_and_rollback_cannot_revive_them()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("clock-jump.vault.json");
+        let (mut broker, owner) =
+            SecretBroker::bootstrap_owner(&path, &password(), MemoryAudit::default())?;
+        let issued_at = 1_000_u64;
+        let issued = broker.register_caller_at(
+            &owner,
+            CallerKind::Application,
+            CallerName::new("clock-backend")?,
+            issued_at,
+        )?;
+        let caller = issued.caller();
+        let expires_at = issued_at + DEFAULT_CREDENTIAL_LIFETIME_MILLIS;
+        assert!(
+            broker
+                .authenticate_caller_at(
+                    caller.id(),
+                    caller.kind(),
+                    issued.credential(),
+                    issued_at + 1,
+                )
+                .is_ok()
+        );
+        assert!(matches!(
+            broker.authenticate_caller_at(
+                caller.id(),
+                caller.kind(),
+                issued.credential(),
+                expires_at + 86_400_000,
+            ),
+            Err(BrokerError::CredentialExpired)
+        ));
+        assert!(matches!(
+            broker.authenticate_caller_at(
+                caller.id(),
+                caller.kind(),
+                issued.credential(),
+                issued_at + 1,
+            ),
+            Err(BrokerError::CredentialExpired)
+        ));
         Ok(())
     }
 
@@ -2787,6 +3418,37 @@ mod tests {
             vault.read_secret(database.id())?.expose_secret(),
             b"third-database"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn import_plan_is_value_free_and_does_not_commit() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("vault.json");
+        let (mut broker, owner) =
+            SecretBroker::bootstrap_owner(&path, &password(), MemoryAudit::default())?;
+        broker.import_managed_secrets(
+            &owner,
+            vec![(
+                SecretName::new("DATABASE_URL")?,
+                SecretValue::new(b"existing-database".to_vec()),
+            )],
+        )?;
+        let generation = broker.policy_generation();
+        let plan = broker.plan_import(
+            &owner,
+            &[
+                SecretName::new("DATABASE_URL")?,
+                SecretName::new("API_TOKEN")?,
+            ],
+        )?;
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].name().as_str(), "DATABASE_URL");
+        assert_eq!(plan[0].action(), super::ImportPlanAction::Replace);
+        assert_eq!(plan[1].name().as_str(), "API_TOKEN");
+        assert_eq!(plan[1].action(), super::ImportPlanAction::Create);
+        assert_eq!(broker.policy_generation(), generation);
+        assert_eq!(broker.list(&owner)?.len(), 1);
         Ok(())
     }
 

@@ -16,8 +16,9 @@ CLI-only pre-check.
   millisecond is denied.
 - There is no grace period. Rotation is the recovery path and preserves the
   stable CallerId, CallerKind, name and Policy rules.
-- `identity list` prints the enforced expiry timestamp. A migrated V1/V2 entry
-  prints `legacy-unbounded` until the Owner rotates it.
+- `identity list` prints the enforced expiry timestamp and a status of `ok`,
+  `expiring` (within 14 days), `expired`, or `unbounded`. A migrated V1/V2
+  entry prints `legacy-unbounded` until the Owner rotates it.
 
 The V3 parser accepts only the exact 90-day window or the explicit legacy
 sentinel `(issued=0, expires=u64::MAX)`. Missing, reversed, shortened, extended
@@ -29,8 +30,10 @@ The Broker first advances the persisted last-observed authentication time using
 `max(current, last_observed)`. It then performs the real bounded Argon2id check
 for a known expired credential and combines the constant-time verifier result
 with the lifecycle decision. Expired, wrong, unknown, wrong-kind and throttled
-claims therefore keep the same value-free Audit shape and the same
-`caller identity is unavailable` result.
+claims keep the same value-free Audit shape (`deny` / `invalid_request`). A
+matching verifier with an ended lifetime returns `caller credential has expired`;
+wrong, unknown, wrong-kind and throttled claims still return
+`caller identity is unavailable`. Blocked throttle attempts never reveal expiry.
 
 A successful rotation uses at least the persisted last-observed time as its new
 issuance time. Moving the wall clock backward cannot revive an expired

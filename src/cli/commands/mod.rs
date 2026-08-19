@@ -9,12 +9,13 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::ExitStatus,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::cli::{
     application::CliApplication,
     args::{
-        AuditCommand, Cli, Command, IdentityCommand, KeystoreCommand, PolicyCommand,
+        AuditCommand, Cli, Command, IdentityCommand, KeystoreCommand, OutputFormat, PolicyCommand,
         ProfileCommand, SessionCommand,
     },
     credential_file::{PendingCredentialFile, read as read_credential},
@@ -27,8 +28,10 @@ use crate::cli::{
 };
 use crate::{
     config::{self, Project},
-    dotenv, process,
-    secret::{SecretName, SecretRecord},
+    dotenv,
+    identity::CallerId,
+    process,
+    secret::SecretName,
 };
 
 pub(super) enum ExecutionOutcome {
@@ -41,7 +44,14 @@ pub(super) fn execute(
     sensitive_input: &mut dyn SensitiveInput,
     output: &mut dyn Write,
 ) -> Result<ExecutionOutcome, CliError> {
+    if cli.target.is_some() && !command_accepts_as(&cli.command) {
+        return Err(CliError::NamedTargetUnused);
+    }
     let mut project = config::discover_from_cwd()?;
+    if let Command::Completions { shell } = cli.command {
+        write!(output, "{}", super::completions::render(shell))?;
+        return Ok(ExecutionOutcome::Success);
+    }
     if let Command::Uninstall { purge_project } = cli.command {
         super::uninstall::execute(purge_project, project.as_ref(), sensitive_input, output)?;
         return Ok(ExecutionOutcome::Success);
@@ -73,6 +83,24 @@ pub(super) fn execute(
     dispatch(cli, &vault, project.as_mut(), sensitive_input, output)
 }
 
+fn command_accepts_as(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Identity {
+            command: IdentityCommand::Register { .. },
+        } | Command::Profile { .. }
+            | Command::Policy {
+                command: PolicyCommand::GrantUse { .. }
+                    | PolicyCommand::GrantInspect { .. }
+                    | PolicyCommand::RevokeUse { .. },
+            }
+            | Command::Example { .. }
+            | Command::Run { .. }
+            | Command::Session { .. }
+    )
+}
+
+#[allow(clippy::too_many_lines)]
 fn dispatch(
     cli: Cli,
     vault: &Path,
@@ -80,22 +108,46 @@ fn dispatch(
     sensitive_input: &mut dyn SensitiveInput,
     output: &mut dyn Write,
 ) -> Result<ExecutionOutcome, CliError> {
+    let as_target = cli.target.as_deref();
+    let format = cli.format;
     match cli.command {
-        Command::Init => execute_init(vault, cli.vault.is_none(), sensitive_input, output)?,
-        Command::Set { name } => execute_set(vault, name, sensitive_input, output)?,
-        Command::Verify { name } => execute_verify(vault, name, sensitive_input, output)?,
-        Command::List => execute_list(vault, sensitive_input, output)?,
-        Command::Exists { name } => execute_exists(vault, name, sensitive_input, output)?,
+        Command::Init => execute_init(vault, cli.vault.is_none(), format, sensitive_input, output)?,
+        Command::Set { name } => execute_set(vault, name, format, sensitive_input, output)?,
+        Command::Verify { name } => execute_verify(vault, name, format, sensitive_input, output)?,
+        Command::List { verbose } => {
+            execute_list(vault, verbose, format, sensitive_input, output)?;
+        }
+        Command::Rename { current, new } => {
+            execute_rename(vault, current, new, sensitive_input, output)?;
+        }
+        Command::ChangePassword => execute_change_password(vault, sensitive_input, output)?,
+        Command::Exists { name } => execute_exists(vault, name, format, sensitive_input, output)?,
         Command::Remove { name } => execute_remove(vault, name, sensitive_input, output)?,
-        Command::Import { source } => execute_import(vault, &source, sensitive_input, output)?,
-        Command::Example { output: path } => {
-            execute_example(vault, &path, sensitive_input, output)?;
+        Command::Import { source, dry_run } => {
+            execute_import(vault, &source, dry_run, format, sensitive_input, output)?;
+        }
+        Command::Example {
+            output: path,
+            profile,
+        } => {
+            execute_example(
+                vault,
+                &path,
+                profile,
+                project.as_deref(),
+                as_target,
+                format,
+                sensitive_input,
+                output,
+            )?;
         }
         Command::Identity { command } => {
             execute_identity(
                 vault,
                 command,
                 project.as_deref_mut(),
+                as_target,
+                format,
                 sensitive_input,
                 output,
             )?;
@@ -105,14 +157,26 @@ fn dispatch(
                 vault,
                 command,
                 project.as_deref_mut(),
+                as_target,
+                format,
                 sensitive_input,
                 output,
             )?;
         }
         Command::Policy { command } => {
-            execute_policy(vault, command, project.as_deref(), sensitive_input, output)?;
+            execute_policy(
+                vault,
+                command,
+                project.as_deref(),
+                as_target,
+                format,
+                sensitive_input,
+                output,
+            )?;
         }
-        Command::Audit { command } => execute_audit(vault, command, sensitive_input, output)?,
+        Command::Audit { command } => {
+            execute_audit(vault, command, format, sensitive_input, output)?;
+        }
         Command::Keystore { command } => {
             execute_keystore(vault, command, sensitive_input, output)?;
         }
@@ -121,12 +185,14 @@ fn dispatch(
             machine_unlock,
             command,
         } => {
-            let credential_file = resolve_credential(credential_file, project.as_deref())?;
+            let credential_file =
+                resolve_credential(credential_file, project.as_deref(), as_target)?;
             execute_session(
                 vault,
                 &credential_file,
                 machine_unlock,
                 command,
+                format,
                 sensitive_input,
                 output,
             )?;
@@ -135,19 +201,25 @@ fn dispatch(
             profile,
             credential_file,
             machine_unlock,
+            dry_run,
             command,
         } => {
-            let profile = resolve_profile(profile, project.as_deref())?;
-            let credential_file = resolve_credential(credential_file, project.as_deref())?;
-            return execute_run(
+            return execute_run_command(
                 vault,
-                &profile,
-                &credential_file,
-                &command,
+                project.as_deref(),
+                as_target,
+                profile,
+                credential_file,
                 machine_unlock,
+                dry_run,
+                format,
+                &command,
                 sensitive_input,
-            )
-            .map(ExecutionOutcome::Child);
+                output,
+            );
+        }
+        Command::Completions { shell } => {
+            write!(output, "{}", super::completions::render(shell))?;
         }
         Command::Uninstall { purge_project } => {
             super::uninstall::execute(purge_project, project.as_deref(), sensitive_input, output)?;
@@ -159,6 +231,7 @@ fn dispatch(
 fn execute_set(
     vault: &Path,
     name: String,
+    format: OutputFormat,
     sensitive_input: &mut dyn SensitiveInput,
     output: &mut dyn Write,
 ) -> Result<(), CliError> {
@@ -169,18 +242,182 @@ fn execute_set(
     let record = application.set_secret(name, &value)?;
     writeln!(output, "Secret stored")?;
     writeln!(output, "secret_id: {}", record.id())?;
+    write_next(output, format, &["envvault profile create NAME"])?;
     Ok(())
 }
 
 fn execute_list(
     vault: &Path,
+    verbose: bool,
+    format: OutputFormat,
     sensitive_input: &mut dyn SensitiveInput,
     output: &mut dyn Write,
 ) -> Result<(), CliError> {
     let password = sensitive_input.read_existing()?;
     let mut application = CliApplication::open_owner(vault, &password)?;
-    for record in application.list_secrets()? {
-        writeln!(output, "{}", record.name())?;
+    let records = application.list_secrets()?;
+    let grants = if verbose {
+        application.use_grant_labels()?
+    } else {
+        Vec::new()
+    };
+    if format == OutputFormat::Json {
+        let secrets = records
+            .iter()
+            .map(|record| {
+                if verbose {
+                    let mut users = grants
+                        .iter()
+                        .filter(|(secret_id, _)| *secret_id == record.id())
+                        .map(|(_, label)| serde_json::Value::String(label.clone()))
+                        .collect::<Vec<_>>();
+                    users.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+                    users.dedup();
+                    serde_json::json!({
+                        "name": record.name().as_str(),
+                        "secret_id": record.id().to_string(),
+                        "use": users,
+                    })
+                } else {
+                    serde_json::json!({ "name": record.name().as_str() })
+                }
+            })
+            .collect::<Vec<_>>();
+        return write_json(output, &serde_json::json!({ "secrets": secrets }));
+    }
+    if !verbose {
+        for record in records {
+            writeln!(output, "{}", record.name())?;
+        }
+        return Ok(());
+    }
+    for record in records {
+        let mut users = grants
+            .iter()
+            .filter(|(secret_id, _)| *secret_id == record.id())
+            .map(|(_, label)| label.clone())
+            .collect::<Vec<_>>();
+        users.sort();
+        users.dedup();
+        let grants = if users.is_empty() {
+            "-".to_owned()
+        } else {
+            users.join(",")
+        };
+        writeln!(output, "{}\t{}\tuse:{grants}", record.name(), record.id())?;
+    }
+    Ok(())
+}
+
+fn execute_rename(
+    vault: &Path,
+    current: String,
+    new: String,
+    sensitive_input: &mut dyn SensitiveInput,
+    output: &mut dyn Write,
+) -> Result<(), CliError> {
+    let current = SecretName::new(current)?;
+    let new = SecretName::new(new)?;
+    let password = sensitive_input.read_existing()?;
+    let mut application = CliApplication::open_owner(vault, &password)?;
+    let record = application.rename_secret(&current, new)?;
+    writeln!(output, "Secret renamed")?;
+    writeln!(output, "secret_id: {}", record.id())?;
+    writeln!(output, "name: {}", record.name())?;
+    Ok(())
+}
+
+fn execute_change_password(
+    vault: &Path,
+    sensitive_input: &mut dyn SensitiveInput,
+    output: &mut dyn Write,
+) -> Result<(), CliError> {
+    let current = sensitive_input.read_existing()?;
+    let mut application = CliApplication::open_owner(vault, &current)?;
+    let new_password = sensitive_input.read_new()?;
+    application.change_password(&new_password)?;
+    writeln!(output, "Master password changed")?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_run_command(
+    vault: &Path,
+    project: Option<&Project>,
+    as_target: Option<&str>,
+    profile: Option<PathBuf>,
+    credential_file: Option<PathBuf>,
+    machine_unlock: bool,
+    dry_run: bool,
+    format: OutputFormat,
+    command: &[OsString],
+    sensitive_input: &mut dyn SensitiveInput,
+    output: &mut dyn Write,
+) -> Result<ExecutionOutcome, CliError> {
+    let profile = resolve_profile(profile, project, as_target)?;
+    let credential_file = resolve_credential(credential_file, project, as_target)?;
+    if dry_run {
+        execute_run_preview(
+            vault,
+            &profile,
+            &credential_file,
+            machine_unlock,
+            format,
+            sensitive_input,
+            output,
+        )?;
+        return Ok(ExecutionOutcome::Success);
+    }
+    if command.is_empty() {
+        return Err(CliError::RunCommandRequired);
+    }
+    execute_run(
+        vault,
+        &profile,
+        &credential_file,
+        command,
+        machine_unlock,
+        sensitive_input,
+    )
+    .map(ExecutionOutcome::Child)
+}
+
+fn execute_run_preview(
+    vault: &Path,
+    profile_path: &Path,
+    credential_file: &Path,
+    machine_unlock: bool,
+    format: OutputFormat,
+    sensitive_input: &mut dyn SensitiveInput,
+    output: &mut dyn Write,
+) -> Result<(), CliError> {
+    let profile = read_profile(profile_path)?;
+    let mut application =
+        open_machine_caller(vault, credential_file, machine_unlock, sensitive_input)?;
+    let previews = application.preview_profile_use(&profile)?;
+    if format == OutputFormat::Json {
+        let secrets = previews
+            .iter()
+            .map(|(environment, outcome)| {
+                serde_json::json!({
+                    "environment": environment,
+                    "outcome": outcome.as_str(),
+                })
+            })
+            .collect::<Vec<_>>();
+        return write_json(
+            output,
+            &serde_json::json!({
+                "dry_run": true,
+                "executed": false,
+                "secrets": secrets,
+            }),
+        );
+    }
+    writeln!(output, "dry_run: yes")?;
+    writeln!(output, "executed: no")?;
+    for (environment, outcome) in previews {
+        writeln!(output, "{environment}\t{}", outcome.as_str())?;
     }
     Ok(())
 }
@@ -188,13 +425,18 @@ fn execute_list(
 fn execute_exists(
     vault: &Path,
     name: String,
+    format: OutputFormat,
     sensitive_input: &mut dyn SensitiveInput,
     output: &mut dyn Write,
 ) -> Result<(), CliError> {
     let name = SecretName::new(name)?;
     let password = sensitive_input.read_existing()?;
     let mut application = CliApplication::open_owner(vault, &password)?;
-    writeln!(output, "{}", application.secret_exists(&name)?)?;
+    let exists = application.secret_exists(&name)?;
+    if format == OutputFormat::Json {
+        return write_json(output, &serde_json::json!({ "exists": exists }));
+    }
+    writeln!(output, "{exists}")?;
     Ok(())
 }
 
@@ -215,6 +457,8 @@ fn execute_remove(
 fn execute_import(
     vault: &Path,
     source: &Path,
+    dry_run: bool,
+    format: OutputFormat,
     sensitive_input: &mut dyn SensitiveInput,
     output: &mut dyn Write,
 ) -> Result<(), CliError> {
@@ -223,31 +467,121 @@ fn execute_import(
     let source_bytes = read_source(source)?;
     let entries = dotenv::parse(&source_bytes)?;
     drop(source_bytes);
+    if dry_run {
+        let names = entries
+            .iter()
+            .map(dotenv::DotenvEntry::name)
+            .cloned()
+            .collect::<Vec<_>>();
+        drop(entries);
+        let plan = application.plan_import(&names)?;
+        let create = plan
+            .iter()
+            .filter(|item| item.action() == crate::broker::service::ImportPlanAction::Create)
+            .count();
+        let replace = plan
+            .iter()
+            .filter(|item| item.action() == crate::broker::service::ImportPlanAction::Replace)
+            .count();
+        let conflict = plan
+            .iter()
+            .filter(|item| item.action() == crate::broker::service::ImportPlanAction::Conflict)
+            .count();
+        if format == OutputFormat::Json {
+            let entries = plan
+                .iter()
+                .map(|item| {
+                    serde_json::json!({
+                        "name": item.name().as_str(),
+                        "action": item.action().as_str(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            return write_json(
+                output,
+                &serde_json::json!({
+                    "dry_run": true,
+                    "committed": false,
+                    "create": create,
+                    "replace": replace,
+                    "conflict": conflict,
+                    "source_preserved": true,
+                    "entries": entries,
+                }),
+            );
+        }
+        writeln!(output, "dry_run: yes")?;
+        writeln!(output, "committed: no")?;
+        writeln!(output, "create: {create}")?;
+        writeln!(output, "replace: {replace}")?;
+        writeln!(output, "conflict: {conflict}")?;
+        writeln!(output, "source_preserved: yes")?;
+        for item in plan {
+            writeln!(output, "{}\t{}", item.name(), item.action().as_str())?;
+        }
+        return Ok(());
+    }
     let imported = application.import_secrets(entries)?;
     writeln!(output, "Imported {} Secrets", imported.len())?;
     writeln!(output, "source_preserved: yes")?;
+    write_next(output, format, &["envvault profile create NAME"])?;
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_example(
     vault: &Path,
     path: &Path,
+    profile: Option<PathBuf>,
+    project: Option<&Project>,
+    as_target: Option<&str>,
+    format: OutputFormat,
     sensitive_input: &mut dyn SensitiveInput,
     output: &mut dyn Write,
 ) -> Result<(), CliError> {
     let password = sensitive_input.read_existing()?;
     let mut application = CliApplication::open_owner(vault, &password)?;
-    let records = application.list_secrets()?;
-    let example = dotenv::render_example(records.iter().map(SecretRecord::name))?;
+    let names = example_names(&mut application, profile, project, as_target)?;
+    let example = dotenv::render_example(names.iter())?;
     write_new(path, &example)?;
     writeln!(output, "Example generated")?;
     writeln!(output, "example_file_created: yes")?;
+    write_next(output, format, &["envvault run -- ./app"])?;
     Ok(())
+}
+
+fn example_names(
+    application: &mut CliApplication,
+    profile: Option<PathBuf>,
+    project: Option<&Project>,
+    as_target: Option<&str>,
+) -> Result<Vec<SecretName>, CliError> {
+    if profile.is_none() && as_target.is_none() {
+        return Ok(application
+            .list_secrets()?
+            .into_iter()
+            .map(|record| record.name().clone())
+            .collect());
+    }
+    let profile = read_profile(&resolve_profile(profile, project, as_target)?)?;
+    let listed = application.list_secrets()?;
+    let mut names = Vec::with_capacity(profile.bindings().len());
+    for binding in profile.bindings() {
+        if !listed
+            .iter()
+            .any(|record| record.id() == binding.secret_id())
+        {
+            return Err(CliError::SecretUnavailable);
+        }
+        names.push(SecretName::new(binding.environment().to_owned())?);
+    }
+    Ok(names)
 }
 
 fn execute_verify(
     vault: &Path,
     name: String,
+    format: OutputFormat,
     sensitive_input: &mut dyn SensitiveInput,
     output: &mut dyn Write,
 ) -> Result<(), CliError> {
@@ -256,13 +590,18 @@ fn execute_verify(
     let mut application = CliApplication::open_owner(vault, &password)?;
     let expected = sensitive_input.read_expected_secret_value()?;
     let matches = application.verify_secret(&name, &expected)?;
-    writeln!(output, "{}", if matches { "match" } else { "mismatch" })?;
+    let result = if matches { "match" } else { "mismatch" };
+    if format == OutputFormat::Json {
+        return write_json(output, &serde_json::json!({ "result": result }));
+    }
+    writeln!(output, "{result}")?;
     Ok(())
 }
 
 fn execute_init(
     vault: &Path,
     write_project_file: bool,
+    format: OutputFormat,
     sensitive_input: &mut dyn SensitiveInput,
     output: &mut dyn Write,
 ) -> Result<(), CliError> {
@@ -276,13 +615,28 @@ fn execute_init(
     if write_project_file {
         let cwd = env::current_dir().map_err(|_| CliError::OutputUnavailable)?;
         let project = config::default_layout(&cwd);
-        match config::write_new(&project) {
-            Ok(()) => {
-                writeln!(output, "project_file: {}", project.file_path().display())?;
-            }
-            Err(config::ProjectError::AlreadyExists) => {}
-            Err(error) => return Err(error.into()),
+        write_init_project_files(&project, output)?;
+    }
+    write_next(
+        output,
+        format,
+        &["envvault import --dry-run .env", "envvault set NAME"],
+    )?;
+    Ok(())
+}
+
+fn write_init_project_files(project: &Project, output: &mut dyn Write) -> Result<(), CliError> {
+    match config::write_new(project) {
+        Ok(()) => {
+            writeln!(output, "project_file: {}", project.file_path().display())?;
         }
+        Err(config::ProjectError::AlreadyExists) => {}
+        Err(error) => return Err(error.into()),
+    }
+    match config::ensure_gitignore(project.root())? {
+        config::GitignoreStatus::Created => writeln!(output, "gitignore: created")?,
+        config::GitignoreStatus::Updated => writeln!(output, "gitignore: updated")?,
+        config::GitignoreStatus::Unchanged => writeln!(output, "gitignore: unchanged")?,
     }
     Ok(())
 }
@@ -291,25 +645,142 @@ fn execute_policy(
     vault: &Path,
     command: PolicyCommand,
     project: Option<&Project>,
+    as_target: Option<&str>,
+    format: OutputFormat,
     sensitive_input: &mut dyn SensitiveInput,
     output: &mut dyn Write,
 ) -> Result<(), CliError> {
     match command {
+        PolicyCommand::List => {
+            let password = sensitive_input.read_existing()?;
+            let mut application = CliApplication::open_owner(vault, &password)?;
+            let (generation, listings) = application.list_policy_rules()?;
+            if format == OutputFormat::Json {
+                let rules = listings
+                    .iter()
+                    .map(|listing| {
+                        serde_json::json!({
+                            "caller_id": listing.caller().id().to_string(),
+                            "caller_kind": listing.caller().kind().to_string(),
+                            "caller_name": listing
+                                .caller_name()
+                                .map_or("-", crate::identity::CallerName::as_str),
+                            "secret": listing.secret_name().map_or_else(
+                                || listing.secret_id().to_string(),
+                                ToString::to_string,
+                            ),
+                            "operation": listing.operation().as_str(),
+                            "effect": listing.effect().as_str(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                write_json(
+                    output,
+                    &serde_json::json!({
+                        "policy_generation": generation,
+                        "rules": rules,
+                    }),
+                )?;
+                return Ok(());
+            }
+            writeln!(output, "policy_generation: {generation}")?;
+            for listing in listings {
+                let caller_name = listing
+                    .caller_name()
+                    .map_or("-", crate::identity::CallerName::as_str);
+                let secret = listing
+                    .secret_name()
+                    .map_or_else(|| listing.secret_id().to_string(), ToString::to_string);
+                writeln!(
+                    output,
+                    "{}\t{}\t{}\t{secret}\t{}\t{}",
+                    listing.caller().id(),
+                    listing.caller().kind(),
+                    caller_name,
+                    listing.operation(),
+                    listing.effect().as_str(),
+                )?;
+            }
+        }
         PolicyCommand::GrantUse { caller_id, profile } => {
-            let caller_id = caller_id
-                .or_else(|| project.and_then(Project::caller_id))
-                .ok_or(CliError::ProjectDefaultMissing)?;
-            let profile = resolve_profile(profile, project)?;
-            let profile = read_profile(&profile)?;
+            let caller_id = resolve_policy_caller(caller_id, project, as_target)?;
+            let profile = read_profile(&resolve_profile(profile, project, as_target)?)?;
             let password = sensitive_input.read_existing()?;
             let mut application = CliApplication::open_owner(vault, &password)?;
             let generation = application.grant_profile_use(caller_id, &profile)?;
             writeln!(output, "Profile use granted")?;
             writeln!(output, "bindings: {}", profile.bindings().len())?;
             writeln!(output, "policy_generation: {generation}")?;
+            write_next(output, format, &["envvault run -- ./app"])?;
+        }
+        PolicyCommand::GrantInspect { caller_id, profile } => {
+            let caller_id = resolve_policy_caller(caller_id, project, as_target)?;
+            let profile = read_profile(&resolve_profile(profile, project, as_target)?)?;
+            let password = sensitive_input.read_existing()?;
+            let mut application = CliApplication::open_owner(vault, &password)?;
+            let generation = application.grant_profile_inspect(caller_id, &profile)?;
+            writeln!(output, "Profile inspect granted")?;
+            writeln!(output, "bindings: {}", profile.bindings().len())?;
+            writeln!(output, "policy_generation: {generation}")?;
+            write_next(output, format, &["envvault run --dry-run"])?;
+        }
+        PolicyCommand::RevokeUse {
+            caller_id,
+            profile,
+            secrets,
+        } => {
+            let caller_id = resolve_policy_caller(caller_id, project, as_target)?;
+            let password = sensitive_input.read_existing()?;
+            let mut application = CliApplication::open_owner(vault, &password)?;
+            let secret_ids =
+                resolve_revoke_secret_ids(&mut application, project, as_target, profile, secrets)?;
+            let generation = application.revoke_use(caller_id, &secret_ids)?;
+            writeln!(output, "Use grants revoked")?;
+            writeln!(output, "secrets: {}", secret_ids.len())?;
+            writeln!(output, "policy_generation: {generation}")?;
         }
     }
     Ok(())
+}
+
+fn resolve_policy_caller(
+    caller_id: Option<CallerId>,
+    project: Option<&Project>,
+    as_target: Option<&str>,
+) -> Result<CallerId, CliError> {
+    if let Some(caller_id) = caller_id {
+        return Ok(caller_id);
+    }
+    if let Some(name) = as_target {
+        return require_target(project, name)?
+            .caller_id()
+            .ok_or(CliError::ProjectTargetIncomplete);
+    }
+    project
+        .and_then(Project::caller_id)
+        .ok_or(CliError::ProjectDefaultMissing)
+}
+
+fn resolve_revoke_secret_ids(
+    application: &mut CliApplication,
+    project: Option<&Project>,
+    as_target: Option<&str>,
+    profile: Option<PathBuf>,
+    secrets: Vec<String>,
+) -> Result<Vec<crate::secret::SecretId>, CliError> {
+    if secrets.is_empty() {
+        let profile = read_profile(&resolve_profile(profile, project, as_target)?)?;
+        return Ok(profile
+            .bindings()
+            .iter()
+            .map(crate::profile::ProfileBinding::secret_id)
+            .collect());
+    }
+    let mut names = Vec::with_capacity(secrets.len());
+    for name in secrets {
+        names.push(SecretName::new(name)?);
+    }
+    application.secret_ids_for_names(names)
 }
 
 fn execute_keystore(
@@ -333,19 +804,96 @@ fn execute_keystore(
     Ok(())
 }
 
+fn execute_audit_list(
+    vault: &Path,
+    caller_id: Option<CallerId>,
+    secret: Option<String>,
+    operation: Option<String>,
+    format: OutputFormat,
+    sensitive_input: &mut dyn SensitiveInput,
+    output: &mut dyn Write,
+) -> Result<(), CliError> {
+    let password = sensitive_input.read_existing()?;
+    let mut application = CliApplication::open_owner(vault, &password)?;
+    let secret_id = match secret {
+        Some(name) => {
+            let name = SecretName::new(name)?;
+            Some(
+                application
+                    .list_secrets()?
+                    .into_iter()
+                    .find(|record| record.name() == &name)
+                    .ok_or(CliError::SecretUnavailable)?
+                    .id(),
+            )
+        }
+        None => None,
+    };
+    let operation = match operation {
+        Some(code) => Some(
+            code.parse::<crate::policy::Operation>()
+                .map_err(|_| CliError::InvalidAuditFilter)?,
+        ),
+        None => None,
+    };
+    let mut events = Vec::new();
+    for event in application.audit_events()? {
+        if caller_id.is_some_and(|id| event.caller().id() != id) {
+            continue;
+        }
+        if secret_id.is_some_and(|id| event.secret_id() != Some(id)) {
+            continue;
+        }
+        if operation.is_some_and(|value| event.operation() != Some(value)) {
+            continue;
+        }
+        events.push(event);
+    }
+    if format == OutputFormat::Json {
+        let events = events
+            .into_iter()
+            .map(|event| {
+                serde_json::json!({
+                    "unix_time_millis": event.unix_time_millis(),
+                    "caller_kind": event.caller().kind().to_string(),
+                    "caller_id": event.caller().id().to_string(),
+                    "authentication_method": event.authentication_method().as_str(),
+                    "target": audit_target(&event),
+                    "decision": audit_decision(&event),
+                })
+            })
+            .collect::<Vec<_>>();
+        write_json(output, &serde_json::json!({ "events": events }))
+    } else {
+        for event in events {
+            write_audit_event(output, event)?;
+        }
+        Ok(())
+    }
+}
+
 fn execute_audit(
     vault: &Path,
     command: AuditCommand,
+    format: OutputFormat,
     sensitive_input: &mut dyn SensitiveInput,
     output: &mut dyn Write,
 ) -> Result<(), CliError> {
     match command {
-        AuditCommand::List => {
-            let password = sensitive_input.read_existing()?;
-            let mut application = CliApplication::open_owner(vault, &password)?;
-            for event in application.audit_events()? {
-                write_audit_event(output, event)?;
-            }
+        AuditCommand::List {
+            caller_id,
+            secret,
+            operation,
+        } => {
+            execute_audit_list(
+                vault,
+                caller_id,
+                secret,
+                operation,
+                format,
+                sensitive_input,
+                output,
+            )?;
         }
         AuditCommand::MigrateV2 => {
             let password = sensitive_input.read_existing()?;
@@ -477,21 +1025,28 @@ fn write_anchor_status(vault: &Path, output: &mut dyn Write) -> Result<(), CliEr
     Ok(())
 }
 
-fn hex_digest(bytes: &[u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(64);
-    for byte in bytes {
-        out.push(HEX[usize::from(byte >> 4)] as char);
-        out.push(HEX[usize::from(byte & 0x0f)] as char);
-    }
-    out
+fn write_json(output: &mut dyn Write, value: &serde_json::Value) -> Result<(), CliError> {
+    let encoded = serde_json::to_string(value).map_err(|_| CliError::OutputUnavailable)?;
+    writeln!(output, "{encoded}")?;
+    Ok(())
 }
 
-fn write_audit_event(
+fn write_next(
     output: &mut dyn Write,
-    event: crate::audit::AuditEvent,
+    format: OutputFormat,
+    steps: &[&str],
 ) -> Result<(), CliError> {
-    let target = event.secret_id().map_or_else(
+    if format != OutputFormat::Text {
+        return Ok(());
+    }
+    for step in steps {
+        writeln!(output, "next: {step}")?;
+    }
+    Ok(())
+}
+
+fn audit_target(event: &crate::audit::AuditEvent) -> String {
+    event.secret_id().map_or_else(
         || {
             if event.is_authentication_attempt() {
                 "authentication".to_owned()
@@ -508,7 +1063,56 @@ fn write_audit_event(
                 .map_or_else(|| "invalid".to_owned(), |value| value.to_string());
             format!("secret:{secret_id}:{operation}")
         },
-    );
+    )
+}
+
+fn audit_decision(event: &crate::audit::AuditEvent) -> String {
+    match event.decision() {
+        crate::policy::PolicyDecision::Allow => "allow".to_owned(),
+        crate::policy::PolicyDecision::Deny(reason) => {
+            let code = match reason {
+                crate::policy::DenyReason::DefaultDeny => "default_deny",
+                crate::policy::DenyReason::NoMatchingGrant => "no_matching_grant",
+                crate::policy::DenyReason::ExplicitDeny => "explicit_deny",
+                crate::policy::DenyReason::InvalidRequest => "invalid_request",
+            };
+            format!("deny:{code}")
+        }
+    }
+}
+
+fn hex_digest(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push(HEX[usize::from(byte >> 4)] as char);
+        out.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    out
+}
+
+const EXPIRING_SOON_MILLIS: u64 = 14 * 24 * 60 * 60 * 1_000;
+
+fn credential_expiry_status(expires: Option<u64>) -> (String, &'static str) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        });
+    match expires {
+        None => ("legacy-unbounded".to_owned(), "unbounded"),
+        Some(expiry) if now >= expiry => (expiry.to_string(), "expired"),
+        Some(expiry) if expiry.saturating_sub(now) <= EXPIRING_SOON_MILLIS => {
+            (expiry.to_string(), "expiring")
+        }
+        Some(expiry) => (expiry.to_string(), "ok"),
+    }
+}
+
+fn write_audit_event(
+    output: &mut dyn Write,
+    event: crate::audit::AuditEvent,
+) -> Result<(), CliError> {
     writeln!(
         output,
         "{}\t{}:{}\t{}\t{}\t{:?}",
@@ -516,7 +1120,7 @@ fn write_audit_event(
         event.caller().kind(),
         event.caller().id(),
         event.authentication_method().as_str(),
-        target,
+        audit_target(&event),
         event.decision()
     )?;
     Ok(())
@@ -526,6 +1130,8 @@ fn execute_profile(
     vault: &Path,
     command: ProfileCommand,
     project: Option<&mut Project>,
+    as_target: Option<&str>,
+    format: OutputFormat,
     sensitive_input: &mut dyn SensitiveInput,
     output: &mut dyn Write,
 ) -> Result<(), CliError> {
@@ -538,7 +1144,7 @@ fn execute_profile(
                 .into_iter()
                 .map(SecretName::new)
                 .collect::<Result<Vec<_>, _>>()?;
-            let path = resolve_profile(path, project.as_deref())?;
+            let path = resolve_profile_output(path, project.as_deref(), as_target)?;
             if let Some(parent) = path.parent() {
                 config::ensure_vault_dir(parent)?;
             }
@@ -546,12 +1152,18 @@ fn execute_profile(
             let mut application = CliApplication::open_owner(vault, &password)?;
             let profile = application.create_profile(names)?;
             write_new_profile(&path, &profile)?;
-            if let Some(project) = project {
+            if let Some(name) = as_target {
+                let Some(project) = project else {
+                    return Err(CliError::NamedTargetRequiresProject);
+                };
+                project.set_named_profile(name, &path)?;
+            } else if let Some(project) = project {
                 project.set_default_profile(&path)?;
             }
             writeln!(output, "Profile created")?;
             writeln!(output, "bindings: {}", profile.bindings().len())?;
             writeln!(output, "profile_file_created: yes")?;
+            write_next(output, format, &["envvault policy grant-use"])?;
         }
     }
     Ok(())
@@ -577,6 +1189,7 @@ fn execute_session(
     credential_file: &Path,
     machine_unlock: bool,
     command: SessionCommand,
+    format: OutputFormat,
     sensitive_input: &mut dyn SensitiveInput,
     output: &mut dyn Write,
 ) -> Result<(), CliError> {
@@ -584,13 +1197,24 @@ fn execute_session(
     match command {
         SessionCommand::Whoami => {
             let caller = application.authenticated_caller();
-            writeln!(output, "caller_id: {}", caller.id())?;
-            writeln!(output, "caller_kind: {}", caller.kind())?;
-            writeln!(
-                output,
-                "authentication_method: {}",
-                application.authentication_method().as_str()
-            )?;
+            if format == OutputFormat::Json {
+                write_json(
+                    output,
+                    &serde_json::json!({
+                        "caller_id": caller.id().to_string(),
+                        "caller_kind": caller.kind().to_string(),
+                        "authentication_method": application.authentication_method().as_str(),
+                    }),
+                )?;
+            } else {
+                writeln!(output, "caller_id: {}", caller.id())?;
+                writeln!(output, "caller_kind: {}", caller.kind())?;
+                writeln!(
+                    output,
+                    "authentication_method: {}",
+                    application.authentication_method().as_str()
+                )?;
+            }
         }
     }
     Ok(())
@@ -627,6 +1251,8 @@ fn execute_identity(
     vault: &Path,
     command: IdentityCommand,
     mut project: Option<&mut Project>,
+    as_target: Option<&str>,
+    format: OutputFormat,
     sensitive_input: &mut dyn SensitiveInput,
     output: &mut dyn Write,
 ) -> Result<(), CliError> {
@@ -638,6 +1264,9 @@ fn execute_identity(
         } => {
             let credential_file = match credential_file {
                 Some(path) => path,
+                None if as_target.is_some() => {
+                    default_named_file(project.as_deref(), as_target, "credential.json")?
+                }
                 None => default_credential_path(project.as_deref(), &name)?,
             };
             if let Some(parent) = credential_file.parent() {
@@ -651,29 +1280,53 @@ fn execute_identity(
             let issued = application.commit_caller_registration(prepared)?;
             destination.write(&issued)?;
             delivery.finish()?;
-            if let Some(project) = project.as_mut() {
+            if let Some(name) = as_target {
+                let Some(project) = project.as_mut() else {
+                    return Err(CliError::NamedTargetRequiresProject);
+                };
+                project.set_named_caller(name, issued.caller().id(), &credential_file)?;
+            } else if let Some(project) = project.as_mut() {
                 project.set_default_caller(issued.caller().id(), &credential_file)?;
             }
             writeln!(output, "Caller registered")?;
             writeln!(output, "caller_id: {}", issued.caller().id())?;
             writeln!(output, "caller_kind: {}", issued.caller().kind())?;
             writeln!(output, "credential_file_created: yes")?;
+            write_next(output, format, &["envvault profile create SECRET"])?;
         }
         IdentityCommand::List => {
             let password = sensitive_input.read_existing()?;
             let mut application = CliApplication::open_owner(vault, &password)?;
-            for registered in application.registered_callers()? {
-                let expiry = registered
-                    .credential_expires_unix_time_millis()
-                    .map_or_else(|| "legacy-unbounded".to_owned(), |value| value.to_string());
-                writeln!(
-                    output,
-                    "{}\t{}\t{}\t{}",
-                    registered.caller().id(),
-                    registered.caller().kind(),
-                    registered.name().as_str(),
-                    expiry,
-                )?;
+            let callers = application.registered_callers()?;
+            if format == OutputFormat::Json {
+                let callers = callers
+                    .iter()
+                    .map(|registered| {
+                        let (expiry, status) = credential_expiry_status(
+                            registered.credential_expires_unix_time_millis(),
+                        );
+                        serde_json::json!({
+                            "caller_id": registered.caller().id().to_string(),
+                            "caller_kind": registered.caller().kind().to_string(),
+                            "name": registered.name().as_str(),
+                            "expires": expiry,
+                            "status": status,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                write_json(output, &serde_json::json!({ "callers": callers }))?;
+            } else {
+                for registered in callers {
+                    let (expiry, status) =
+                        credential_expiry_status(registered.credential_expires_unix_time_millis());
+                    writeln!(
+                        output,
+                        "{}\t{}\t{}\t{expiry}\t{status}",
+                        registered.caller().id(),
+                        registered.caller().kind(),
+                        registered.name().as_str(),
+                    )?;
+                }
             }
         }
         IdentityCommand::Revoke { caller_id } => {
@@ -724,19 +1377,87 @@ fn resolve_vault(
 fn resolve_profile(
     explicit: Option<PathBuf>,
     project: Option<&Project>,
+    as_target: Option<&str>,
 ) -> Result<PathBuf, CliError> {
-    explicit
-        .or_else(|| project.map(|value| value.profile().to_path_buf()))
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    if let Some(name) = as_target {
+        return require_target(project, name)?
+            .profile()
+            .map(Path::to_path_buf)
+            .ok_or(CliError::ProjectTargetIncomplete);
+    }
+    project
+        .map(|value| value.profile().to_path_buf())
         .ok_or(CliError::ProjectDefaultMissing)
+}
+
+fn resolve_profile_output(
+    explicit: Option<PathBuf>,
+    project: Option<&Project>,
+    as_target: Option<&str>,
+) -> Result<PathBuf, CliError> {
+    if explicit.is_some() {
+        return resolve_profile(explicit, project, None);
+    }
+    if as_target.is_some() {
+        return default_named_file(project, as_target, "profile.json");
+    }
+    resolve_profile(None, project, None)
 }
 
 fn resolve_credential(
     explicit: Option<PathBuf>,
     project: Option<&Project>,
+    as_target: Option<&str>,
 ) -> Result<PathBuf, CliError> {
-    explicit
-        .or_else(|| project.map(|value| value.credential_file().to_path_buf()))
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    if let Some(name) = as_target {
+        return require_target(project, name)?
+            .credential_file()
+            .map(Path::to_path_buf)
+            .ok_or(CliError::ProjectTargetIncomplete);
+    }
+    project
+        .map(|value| value.credential_file().to_path_buf())
         .ok_or(CliError::ProjectDefaultMissing)
+}
+
+fn require_target<'a>(
+    project: Option<&'a Project>,
+    name: &str,
+) -> Result<&'a crate::config::ProjectTarget, CliError> {
+    validate_as_name(name)?;
+    let project = project.ok_or(CliError::NamedTargetRequiresProject)?;
+    project.target(name).ok_or(CliError::UnknownProjectTarget)
+}
+
+fn validate_as_name(name: &str) -> Result<(), CliError> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(CliError::InvalidTargetName);
+    }
+    Ok(())
+}
+
+fn default_named_file(
+    project: Option<&Project>,
+    as_target: Option<&str>,
+    suffix: &str,
+) -> Result<PathBuf, CliError> {
+    let name = as_target.ok_or(CliError::InvalidTargetName)?;
+    validate_as_name(name)?;
+    let root = project
+        .map(Project::root)
+        .ok_or(CliError::NamedTargetRequiresProject)?;
+    Ok(root.join(".envvault").join(format!("{name}.{suffix}")))
 }
 
 fn default_credential_path(project: Option<&Project>, name: &str) -> Result<PathBuf, CliError> {
@@ -767,8 +1488,8 @@ mod tests {
     use crate::{
         cli::{
             args::{
-                AuditCommand, CallerKindArg, Cli, Command, IdentityCommand, PolicyCommand,
-                ProfileCommand, SessionCommand,
+                AuditCommand, CallerKindArg, Cli, Command, CompletionShell, IdentityCommand,
+                OutputFormat, PolicyCommand, ProfileCommand, SessionCommand,
             },
             error::CliError,
             password::{ConfirmReader, PasswordReader, SecretValueReader},
@@ -793,6 +1514,11 @@ mod tests {
 
         fn with_secret_values(mut self, values: &[&[u8]]) -> Self {
             self.secret_values = values.iter().map(|value| value.to_vec()).collect();
+            self
+        }
+
+        fn then_password(mut self, value: &[u8]) -> Self {
+            self.passwords.push_back(value.to_vec());
             self
         }
 
@@ -887,8 +1613,220 @@ mod tests {
         Cli {
             vault: Some(vault),
             masked_input: false,
+            target: None,
+            format: OutputFormat::Text,
             command,
         }
+    }
+
+    #[test]
+    fn as_is_rejected_on_owner_list() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let vault = directory.path().join("as-unused.vault.json");
+        let mut input = FixedSensitiveInput::repeated(b"unused-as-password", 1);
+        let mut output = Vec::new();
+        let mut command = cli(vault, Command::List { verbose: false });
+        command.target = Some("backend".to_owned());
+        assert!(matches!(
+            execute(command, &mut input, &mut output),
+            Err(CliError::NamedTargetUnused)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn named_target_resolution_does_not_use_the_default_caller()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempdir()?;
+        let mut project = crate::config::default_layout(root.path());
+        crate::config::write_new(&project)?;
+        let default_id = CallerId::from_bytes([0x11; 16]);
+        let named_id = CallerId::from_bytes([0x22; 16]);
+        project.set_default_caller(
+            default_id,
+            &root.path().join(".envvault/app.credential.json"),
+        )?;
+        project.set_named_caller(
+            "backend",
+            named_id,
+            &root.path().join(".envvault/backend.credential.json"),
+        )?;
+        project.set_named_profile(
+            "backend",
+            &root.path().join(".envvault/backend.profile.json"),
+        )?;
+
+        assert_eq!(
+            super::resolve_policy_caller(None, Some(&project), None)?,
+            default_id
+        );
+        assert_eq!(
+            super::resolve_policy_caller(None, Some(&project), Some("backend"))?,
+            named_id
+        );
+        assert!(
+            super::resolve_profile(None, Some(&project), Some("backend"))?
+                .ends_with("backend.profile.json")
+        );
+        assert!(matches!(
+            super::resolve_credential(None, Some(&project), Some("agent")),
+            Err(CliError::UnknownProjectTarget)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn completions_are_value_free_and_do_not_need_a_vault() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut input = FixedSensitiveInput::repeated(b"unused", 0);
+        let mut output = Vec::new();
+        execute(
+            Cli {
+                vault: None,
+                masked_input: false,
+                target: None,
+                format: OutputFormat::Text,
+                command: Command::Completions {
+                    shell: CompletionShell::Bash,
+                },
+            },
+            &mut input,
+            &mut output,
+        )?;
+        let script = String::from_utf8(output)?;
+        assert!(script.contains("complete -F _envvault envvault"));
+        assert!(script.contains("change-password"));
+        Ok(())
+    }
+
+    #[test]
+    fn verbose_list_prints_id_without_values() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let vault = directory.path().join("verbose.vault.json");
+        let password = b"verbose-cli-test-password";
+        let secret = b"verbose-cli-secret-value";
+        let mut input = FixedSensitiveInput::repeated(password, 3).with_secret_values(&[secret]);
+        let mut output = Vec::new();
+        execute(cli(vault.clone(), Command::Init), &mut input, &mut output)?;
+        execute(
+            cli(
+                vault.clone(),
+                Command::Set {
+                    name: "API_TOKEN".to_owned(),
+                },
+            ),
+            &mut input,
+            &mut output,
+        )?;
+        output.clear();
+        execute(
+            cli(vault, Command::List { verbose: true }),
+            &mut input,
+            &mut output,
+        )?;
+        let listed = String::from_utf8(output)?;
+        assert!(listed.contains("API_TOKEN"));
+        assert!(listed.contains("use:"));
+        assert!(!listed.contains(std::str::from_utf8(secret)?));
+        Ok(())
+    }
+
+    #[test]
+    fn list_json_is_value_free() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let vault = directory.path().join("json.vault.json");
+        let password = b"json-cli-test-password";
+        let secret = b"json-cli-secret-value";
+        let mut input = FixedSensitiveInput::repeated(password, 3).with_secret_values(&[secret]);
+        let mut output = Vec::new();
+        execute(cli(vault.clone(), Command::Init), &mut input, &mut output)?;
+        execute(
+            cli(
+                vault.clone(),
+                Command::Set {
+                    name: "API_TOKEN".to_owned(),
+                },
+            ),
+            &mut input,
+            &mut output,
+        )?;
+        output.clear();
+        let mut command = cli(vault, Command::List { verbose: false });
+        command.format = OutputFormat::Json;
+        execute(command, &mut input, &mut output)?;
+        let listed = String::from_utf8(output)?;
+        assert!(listed.contains("\"secrets\""));
+        assert!(listed.contains("API_TOKEN"));
+        assert!(!listed.contains(std::str::from_utf8(secret)?));
+        Ok(())
+    }
+
+    #[test]
+    fn rename_then_plain_list_is_value_free() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let vault = directory.path().join("rename.vault.json");
+        let password = b"rename-cli-test-password";
+        let secret = b"rename-cli-secret-value";
+        let mut input = FixedSensitiveInput::repeated(password, 4).with_secret_values(&[secret]);
+        let mut output = Vec::new();
+        execute(cli(vault.clone(), Command::Init), &mut input, &mut output)?;
+        execute(
+            cli(
+                vault.clone(),
+                Command::Set {
+                    name: "OLD_NAME".to_owned(),
+                },
+            ),
+            &mut input,
+            &mut output,
+        )?;
+        execute(
+            cli(
+                vault.clone(),
+                Command::Rename {
+                    current: "OLD_NAME".to_owned(),
+                    new: "NEW_NAME".to_owned(),
+                },
+            ),
+            &mut input,
+            &mut output,
+        )?;
+        output.clear();
+        execute(
+            cli(vault, Command::List { verbose: false }),
+            &mut input,
+            &mut output,
+        )?;
+        let listed = String::from_utf8(output)?;
+        assert!(listed.contains("NEW_NAME"));
+        assert!(!listed.contains("OLD_NAME"));
+        assert!(!listed.contains(std::str::from_utf8(secret)?));
+        Ok(())
+    }
+
+    #[test]
+    fn change_password_cli_accepts_the_new_password() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let vault = directory.path().join("pw.vault.json");
+        let password = b"change-cli-old-password";
+        let next_password = b"change-cli-new-password";
+        let mut input = FixedSensitiveInput::repeated(password, 2).then_password(next_password);
+        let mut output = Vec::new();
+        execute(cli(vault.clone(), Command::Init), &mut input, &mut output)?;
+        execute(
+            cli(vault.clone(), Command::ChangePassword),
+            &mut input,
+            &mut output,
+        )?;
+        let mut next = FixedSensitiveInput::repeated(next_password, 1);
+        output = Vec::new();
+        execute(
+            cli(vault, Command::List { verbose: false }),
+            &mut next,
+            &mut output,
+        )?;
+        assert!(output.is_empty() || String::from_utf8(output).is_ok());
+        Ok(())
     }
 
     #[test]
@@ -949,10 +1887,11 @@ mod tests {
         )?;
         let list_output = std::str::from_utf8(&output[list_output_start..])?;
         let fields = list_output.trim().split('\t').collect::<Vec<_>>();
-        assert_eq!(fields.len(), 4);
+        assert_eq!(fields.len(), 5);
         assert_eq!(fields[2], "test-app");
         assert_ne!(fields[3], "legacy-unbounded");
         let _expires_unix_time_millis = fields[3].parse::<u64>()?;
+        assert!(matches!(fields[4], "ok" | "expiring"));
 
         execute(
             cli(
@@ -1051,7 +1990,11 @@ mod tests {
             cli(
                 vault,
                 Command::Audit {
-                    command: AuditCommand::List,
+                    command: AuditCommand::List {
+                        caller_id: None,
+                        secret: None,
+                        operation: None,
+                    },
                 },
             ),
             &mut input,
@@ -1086,7 +2029,11 @@ mod tests {
             &mut input,
             &mut output,
         )?;
-        execute(cli(vault.clone(), Command::List), &mut input, &mut output)?;
+        execute(
+            cli(vault.clone(), Command::List { verbose: false }),
+            &mut input,
+            &mut output,
+        )?;
         execute(
             cli(
                 vault.clone(),
@@ -1158,15 +2105,34 @@ mod tests {
             ),
         )?;
         let original_source = fs::read(&source)?;
-        let mut input = FixedSensitiveInput::repeated(password, 3);
+        let mut input = FixedSensitiveInput::repeated(password, 4);
         let mut output = Vec::new();
 
         execute(cli(vault.clone(), Command::Init), &mut input, &mut output)?;
+        output.clear();
         execute(
             cli(
                 vault.clone(),
                 Command::Import {
                     source: source.clone(),
+                    dry_run: true,
+                },
+            ),
+            &mut input,
+            &mut output,
+        )?;
+        let preview = String::from_utf8(output.clone())?;
+        assert!(preview.contains("dry_run: yes"));
+        assert!(preview.contains("committed: no"));
+        assert!(preview.contains("create: 2"));
+        assert!(preview.contains("DATABASE_URL\tcreate"));
+        assert!(!preview.contains(std::str::from_utf8(database)?));
+        execute(
+            cli(
+                vault.clone(),
+                Command::Import {
+                    source: source.clone(),
+                    dry_run: false,
                 },
             ),
             &mut input,
@@ -1177,6 +2143,7 @@ mod tests {
                 vault,
                 Command::Example {
                     output: example.clone(),
+                    profile: None,
                 },
             ),
             &mut input,
@@ -1199,6 +2166,25 @@ mod tests {
     }
 
     #[test]
+    fn init_project_files_write_gitignore_without_secrets() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempdir()?;
+        let project = crate::config::default_layout(directory.path());
+        let mut output = Vec::new();
+        super::write_init_project_files(&project, &mut output)?;
+        let rendered = String::from_utf8(output)?;
+        assert!(rendered.contains("project_file:"));
+        assert!(rendered.contains("gitignore: created"));
+        let gitignore = fs::read_to_string(directory.path().join(".gitignore"))?;
+        assert!(gitignore.contains(".envvault/"));
+        assert!(gitignore.contains("*.credential.json"));
+        let mut second = Vec::new();
+        super::write_init_project_files(&project, &mut second)?;
+        assert!(String::from_utf8(second)?.contains("gitignore: unchanged"));
+        Ok(())
+    }
+
+    #[test]
     fn invalid_dotenv_import_commits_nothing() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let vault = directory.path().join("invalid.vault.json");
@@ -1211,14 +2197,24 @@ mod tests {
         execute(cli(vault.clone(), Command::Init), &mut input, &mut output)?;
         assert!(
             execute(
-                cli(vault.clone(), Command::Import { source }),
+                cli(
+                    vault.clone(),
+                    Command::Import {
+                        source,
+                        dry_run: false,
+                    },
+                ),
                 &mut input,
                 &mut output,
             )
             .is_err()
         );
         output.clear();
-        execute(cli(vault, Command::List), &mut input, &mut output)?;
+        execute(
+            cli(vault, Command::List { verbose: false }),
+            &mut input,
+            &mut output,
+        )?;
         assert!(output.is_empty());
         Ok(())
     }
@@ -1249,7 +2245,11 @@ mod tests {
             cli(
                 vault.clone(),
                 Command::Audit {
-                    command: AuditCommand::List,
+                    command: AuditCommand::List {
+                        caller_id: None,
+                        secret: None,
+                        operation: None,
+                    },
                 },
             ),
             &mut input,
@@ -1347,6 +2347,7 @@ mod tests {
             profile: Some(profile_file.clone()),
             credential_file: Some(credential_file.clone()),
             machine_unlock: false,
+            dry_run: false,
             command: child_command.clone(),
         };
         assert!(
@@ -1376,6 +2377,208 @@ mod tests {
 
         let output = String::from_utf8(output)?;
         assert!(!output.contains(std::str::from_utf8(secret)?));
+        Ok(())
+    }
+
+    struct PolicyCliFixture {
+        vault: PathBuf,
+        agent_credential: PathBuf,
+        profile_file: PathBuf,
+        app_id: CallerId,
+        agent_id: CallerId,
+    }
+
+    fn caller_id_from_credential(path: &PathBuf) -> Result<CallerId, Box<dyn std::error::Error>> {
+        Ok(CallerId::from_str(
+            serde_json::from_slice::<Value>(&fs::read(path)?)?["caller_id"]
+                .as_str()
+                .ok_or("missing caller id")?,
+        )?)
+    }
+
+    fn prepare_policy_cli_fixture(
+        directory: &std::path::Path,
+        input: &mut FixedSensitiveInput,
+        output: &mut Vec<u8>,
+    ) -> Result<PolicyCliFixture, Box<dyn std::error::Error>> {
+        let vault = directory.join("policy.vault.json");
+        let app_credential = directory.join("backend.credential.json");
+        let agent_credential = directory.join("agent.credential.json");
+        let profile_file = directory.join("shared.profile.json");
+        execute(cli(vault.clone(), Command::Init), input, output)?;
+        execute(
+            cli(
+                vault.clone(),
+                Command::Set {
+                    name: "DATABASE_URL".to_owned(),
+                },
+            ),
+            input,
+            output,
+        )?;
+        execute(
+            cli(
+                vault.clone(),
+                Command::Set {
+                    name: "OPENAI_API_KEY".to_owned(),
+                },
+            ),
+            input,
+            output,
+        )?;
+        execute(
+            cli(
+                vault.clone(),
+                Command::Identity {
+                    command: IdentityCommand::Register {
+                        kind: CallerKindArg::Application,
+                        name: "policy-backend".to_owned(),
+                        credential_file: Some(app_credential.clone()),
+                    },
+                },
+            ),
+            input,
+            output,
+        )?;
+        execute(
+            cli(
+                vault.clone(),
+                Command::Identity {
+                    command: IdentityCommand::Register {
+                        kind: CallerKindArg::AiAgent,
+                        name: "policy-agent".to_owned(),
+                        credential_file: Some(agent_credential.clone()),
+                    },
+                },
+            ),
+            input,
+            output,
+        )?;
+        execute(
+            cli(
+                vault.clone(),
+                Command::Profile {
+                    command: ProfileCommand::Create {
+                        output: Some(profile_file.clone()),
+                        secrets: vec!["DATABASE_URL".to_owned(), "OPENAI_API_KEY".to_owned()],
+                    },
+                },
+            ),
+            input,
+            output,
+        )?;
+        Ok(PolicyCliFixture {
+            app_id: caller_id_from_credential(&app_credential)?,
+            agent_id: caller_id_from_credential(&agent_credential)?,
+            vault,
+            agent_credential,
+            profile_file,
+        })
+    }
+
+    fn policy_list_output(
+        vault: PathBuf,
+        input: &mut FixedSensitiveInput,
+        output: &mut Vec<u8>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        output.clear();
+        execute(
+            cli(
+                vault,
+                Command::Policy {
+                    command: PolicyCommand::List,
+                },
+            ),
+            input,
+            output,
+        )?;
+        Ok(String::from_utf8(output.clone())?)
+    }
+
+    #[test]
+    fn policy_list_inspect_and_revoke_use_are_exact_and_value_free()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let first_secret = b"first-policy-cli-secret";
+        let second_secret = b"second-policy-cli-secret";
+        let mut input = FixedSensitiveInput::repeated(b"policy-cli-test-password", 12)
+            .with_secret_values(&[first_secret, second_secret]);
+        let mut output = Vec::new();
+        let fixture = prepare_policy_cli_fixture(directory.path(), &mut input, &mut output)?;
+
+        execute(
+            cli(
+                fixture.vault.clone(),
+                Command::Policy {
+                    command: PolicyCommand::GrantUse {
+                        caller_id: Some(fixture.app_id),
+                        profile: Some(fixture.profile_file.clone()),
+                    },
+                },
+            ),
+            &mut input,
+            &mut output,
+        )?;
+        execute(
+            cli(
+                fixture.vault.clone(),
+                Command::Policy {
+                    command: PolicyCommand::GrantInspect {
+                        caller_id: Some(fixture.agent_id),
+                        profile: Some(fixture.profile_file.clone()),
+                    },
+                },
+            ),
+            &mut input,
+            &mut output,
+        )?;
+        let listed = policy_list_output(fixture.vault.clone(), &mut input, &mut output)?;
+        assert!(listed.contains("policy-backend") && listed.contains("policy-agent"));
+        assert!(listed.contains("\tuse\tallow") && listed.contains("\tlist\tallow"));
+        assert!(!listed.contains(std::str::from_utf8(first_secret)?));
+
+        assert!(
+            execute(
+                cli(
+                    fixture.vault.clone(),
+                    Command::Run {
+                        profile: Some(fixture.profile_file),
+                        credential_file: Some(fixture.agent_credential),
+                        machine_unlock: false,
+                        dry_run: false,
+                        command: vec![OsString::from("true")],
+                    },
+                ),
+                &mut input,
+                &mut output,
+            )
+            .is_err()
+        );
+        execute(
+            cli(
+                fixture.vault.clone(),
+                Command::Policy {
+                    command: PolicyCommand::RevokeUse {
+                        caller_id: Some(fixture.app_id),
+                        profile: None,
+                        secrets: vec!["OPENAI_API_KEY".to_owned()],
+                    },
+                },
+            ),
+            &mut input,
+            &mut output,
+        )?;
+        let after_revoke = policy_list_output(fixture.vault, &mut input, &mut output)?;
+        assert!(!after_revoke.lines().any(|line| {
+            line.contains(&fixture.app_id.to_string())
+                && line.contains("OPENAI_API_KEY")
+                && line.contains("\tuse\tallow")
+        }));
+        assert!(after_revoke.lines().any(|line| {
+            line.contains(&fixture.app_id.to_string())
+                && line.contains("DATABASE_URL")
+                && line.contains("\tuse\tallow")
+        }));
         Ok(())
     }
 

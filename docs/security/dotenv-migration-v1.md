@@ -5,7 +5,7 @@
 ## 命令
 
 ```text
-envvault --vault <PATH> import <SOURCE>
+envvault --vault <PATH> import [--dry-run] <SOURCE>
 envvault --vault <PATH> example [--output <PATH>]
 ```
 
@@ -46,6 +46,8 @@ Key 必须匹配 `[A-Za-z_][A-Za-z0-9_]*`。重复 key、非法 key、NUL、无�
 - 任一解析、授权、容量、加密、名称冲突、generation 或文件提交失败都不会留下部分 Secret 更新。
 
 授权 Audit 发生在最终批量提交之前，因此一次最终失败的导入可能保留对应的 Allow/Deny 尝试事件。这是安全审计证据，不代表 Secret 已提交。
+
+`import --dry-run` 使用同一套分类：对已有记录检查 `write`（可写则为 `replace`），否则在具有 `exists` 时把同名记为 `conflict`，其余为 `create`。若将创建新 Secret，仍要求 `create_secret` 与 `manage_policy`。预览只输出名称和动作，不含 Value；`committed: no`，源文件不变。有 `conflict` 的真正导入仍整批失败且不提交。
 
 ## 明文生命周期
 

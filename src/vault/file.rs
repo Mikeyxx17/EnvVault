@@ -577,8 +577,91 @@ impl FileVault {
         Ok(SecretRecord::new(secret_id, name))
     }
 
+    pub(crate) fn change_password(
+        &mut self,
+        new_password: &MasterPassword,
+    ) -> Result<(), VaultError> {
+        let salt = generate_array::<{ KdfConfig::SALT_LENGTH }>().map_err(map_crypto_error)?;
+        let kdf = KdfConfig::new(KdfParams::recommended(), salt);
+        let new_key =
+            derive_master_key(new_password, kdf, KdfLimits::default()).map_err(map_crypto_error)?;
+        let mut candidate = self.state.clone();
+        candidate.kdf = kdf;
+        candidate.key_check = encrypt(
+            &new_key,
+            KEY_CHECK_PLAINTEXT,
+            &key_check_aad(self.state.vault_id, kdf),
+        )
+        .map_err(map_crypto_error)?;
+
+        let (identity_generation, identity_payload) = self.identity_payload()?;
+        candidate.identity.envelope = encrypt(
+            &new_key,
+            &identity_payload,
+            &identity_aad(self.state.vault_id, identity_generation),
+        )
+        .map_err(map_crypto_error)?;
+
+        let (policy_generation, policy_payload) = self.policy_payload()?;
+        candidate.policy.envelope = encrypt(
+            &new_key,
+            &policy_payload,
+            &policy_aad(self.state.vault_id, policy_generation),
+        )
+        .map_err(map_crypto_error)?;
+
+        let event_count =
+            u64::try_from(self.state.audit.events.len()).map_err(|_| VaultError::CorruptedAudit)?;
+        candidate.audit.key_envelope = encrypt(
+            &new_key,
+            self.audit_key.expose_secret(),
+            &audit_key_aad(
+                self.state.vault_id,
+                event_count,
+                self.state.audit.head_authenticator,
+            ),
+        )
+        .map_err(map_crypto_error)?;
+
+        let mut records = BTreeMap::new();
+        for secret_id in self.secret_ids() {
+            let stored = self
+                .state
+                .records
+                .get(&secret_id)
+                .ok_or(VaultError::NotFound)?;
+            let record = self.decrypt_record(secret_id, stored)?;
+            let value = self.read_secret(secret_id)?;
+            records.insert(
+                secret_id,
+                self.encrypt_record_with_key(
+                    &new_key,
+                    secret_id,
+                    stored.revision,
+                    record.name(),
+                    &value,
+                )?,
+            );
+        }
+        candidate.records = records;
+        self.commit(candidate)?;
+        self.key = new_key;
+        Ok(())
+    }
+
     fn encrypt_record(
         &self,
+        secret_id: SecretId,
+        revision: u64,
+        name: &SecretName,
+        value: &SecretValue,
+    ) -> Result<StoredRecord, VaultError> {
+        self.encrypt_record_with_key(&self.key, secret_id, revision, name, value)
+    }
+
+    fn encrypt_record_with_key(
+        &self,
+        key: &MasterKey,
         secret_id: SecretId,
         revision: u64,
         name: &SecretName,
@@ -587,7 +670,7 @@ impl FileVault {
         let metadata_payload = encode_metadata(name)?;
         let value_payload = encode_value(value)?;
         let metadata_envelope = encrypt(
-            &self.key,
+            key,
             &metadata_payload,
             &record_aad(
                 METADATA_AAD_DOMAIN,
@@ -598,7 +681,7 @@ impl FileVault {
         )
         .map_err(map_crypto_error)?;
         let value_envelope = encrypt(
-            &self.key,
+            key,
             &value_payload,
             &record_aad(VALUE_AAD_DOMAIN, self.state.vault_id, secret_id, revision),
         )
@@ -963,6 +1046,31 @@ mod tests {
             FileVault::open(&path, &wrong),
             Err(VaultError::UnlockFailed)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn change_password_keeps_secrets_and_rejects_the_old_password()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("vault.json");
+        let mut vault = create_test_vault(&path)?;
+        let record = vault.create_secret(
+            SecretName::new("DATABASE_URL")?,
+            &SecretValue::new(b"postgres://password-change".to_vec()),
+        )?;
+        let new_password = MasterPassword::new(b"replacement-master-password".to_vec());
+        vault.change_password(&new_password)?;
+        drop(vault);
+        assert!(matches!(
+            FileVault::open(&path, &password()),
+            Err(VaultError::UnlockFailed)
+        ));
+        let reopened = FileVault::open(&path, &new_password)?;
+        assert_eq!(
+            reopened.read_secret(record.id())?.expose_secret(),
+            b"postgres://password-change"
+        );
         Ok(())
     }
 

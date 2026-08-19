@@ -14,10 +14,19 @@ pub(super) enum CliError {
     VaultPathRequired,
     Project(ProjectError),
     ProjectDefaultMissing,
+    NamedTargetRequiresProject,
+    NamedTargetUnused,
+    UnknownProjectTarget,
+    ProjectTargetIncomplete,
+    InvalidTargetName,
     InvalidCallerName,
     PasswordInputUnavailable,
     SecretInputUnavailable,
     SecretUnavailable,
+    SecretNotAuthorized,
+    SecretMissing,
+    RunCommandRequired,
+    InvalidAuditFilter,
     Dotenv(DotenvError),
     DotenvSourceUnavailable,
     ExampleFileExists,
@@ -52,6 +61,19 @@ impl fmt::Display for CliError {
             Self::ProjectDefaultMissing => formatter.write_str(
                 "project default path is missing; pass the flag or set it in envvault.json",
             ),
+            Self::NamedTargetRequiresProject => formatter.write_str(
+                "--as requires envvault.json; run envvault init without --vault",
+            ),
+            Self::NamedTargetUnused => formatter.write_str(
+                "--as is only valid with identity register, profile create, policy grant-use/grant-inspect/revoke-use, run, and session",
+            ),
+            Self::UnknownProjectTarget => formatter.write_str(
+                "unknown --as target; register or create a profile with the same --as name first",
+            ),
+            Self::ProjectTargetIncomplete => formatter.write_str(
+                "the --as target is missing a profile, credential file, or caller_id",
+            ),
+            Self::InvalidTargetName => formatter.write_str("invalid --as target name"),
             Self::InvalidCallerName => formatter.write_str("invalid caller name"),
             Self::PasswordInputUnavailable => formatter
                 .write_str("master password input requires an attached interactive terminal"),
@@ -60,6 +82,18 @@ impl fmt::Display for CliError {
             }
             Self::SecretUnavailable => {
                 formatter.write_str("the requested Secret is unavailable")
+            }
+            Self::SecretNotAuthorized => {
+                formatter.write_str("the caller is not authorized to use the requested Secret")
+            }
+            Self::SecretMissing => {
+                formatter.write_str("the requested Secret is not present in the Vault")
+            }
+            Self::RunCommandRequired => formatter.write_str(
+                "run requires a command after `--`, or pass --dry-run to preview injection",
+            ),
+            Self::InvalidAuditFilter => {
+                formatter.write_str("audit list filter is invalid")
             }
             Self::Dotenv(error) => error.fmt(formatter),
             Self::DotenvSourceUnavailable => {
