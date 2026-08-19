@@ -34,19 +34,17 @@ jobs:
         target: [vault, identity_audit, policy_profile, dotenv]
     steps:
       - name: Checkout
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GIT_TERMINAL_PROMPT: "0"
         run: |
-          set -eux
+          set -eu
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
           git init
-          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
-          git config --global --add safe.directory '*'
-          git -c http.extraheader="AUTHORIZATION: bearer ${GH_TOKEN}" \
-            fetch --no-tags --prune --depth 1 origin "${GITHUB_SHA}" \
-            || git -c http.extraheader="AUTHORIZATION: bearer ${GH_TOKEN}" \
-              fetch --no-tags --prune --depth 1 origin "${GITHUB_REF}"
+          host="${GITHUB_SERVER_URL#https://}"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@${host}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --prune --depth 1 origin "${GITHUB_SHA}" \
+            || git fetch --no-tags --prune origin "${GITHUB_SHA}" \
+            || git fetch --no-tags --prune --depth 1 origin "${GITHUB_REF}"
           git checkout --force FETCH_HEAD
+          git remote set-url origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
           git log -1 --oneline
 
       - name: Install nightly Rust with llvm-tools

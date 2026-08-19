@@ -23,23 +23,27 @@ jobs:
   dependency-policy:
     runs-on: ubuntu-latest
     steps:
-      # JS checkout (v4 node20 and v7 node24) failed at job setup
-      # with no step logs on all hosted OSes. Fetch with git instead.
-      - name: Checkout
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GIT_TERMINAL_PROMPT: "0"
+      - name: Job started
         run: |
-          set -eux
+          echo "os=$(uname -s || true)"
+          echo "sha=${GITHUB_SHA}"
+          echo "ref=${GITHUB_REF}"
+          echo "repo=${GITHUB_REPOSITORY}"
+          git --version
+      - name: Checkout
+        run: |
+          set -eu
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
           git init
-          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
-          git config --global --add safe.directory '*'
-          git -c http.extraheader="AUTHORIZATION: bearer ${GH_TOKEN}" \
-            fetch --no-tags --prune --depth 1 origin "${GITHUB_SHA}" \
-            || git -c http.extraheader="AUTHORIZATION: bearer ${GH_TOKEN}" \
-              fetch --no-tags --prune --depth 1 origin "${GITHUB_REF}"
+          host="${GITHUB_SERVER_URL#https://}"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@${host}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --prune --depth 1 origin "${GITHUB_SHA}" \
+            || git fetch --no-tags --prune origin "${GITHUB_SHA}" \
+            || git fetch --no-tags --prune --depth 1 origin "${GITHUB_REF}"
           git checkout --force FETCH_HEAD
+          git remote set-url origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
           git log -1 --oneline
+          git rev-parse HEAD
       - name: Install Rust 1.97.1
         run: |
           CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
@@ -65,21 +69,27 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GIT_TERMINAL_PROMPT: "0"
+      - name: Job started
         run: |
-          set -eux
+          echo "os=$(uname -s || true)"
+          echo "sha=${GITHUB_SHA}"
+          echo "ref=${GITHUB_REF}"
+          echo "repo=${GITHUB_REPOSITORY}"
+          git --version
+      - name: Checkout
+        run: |
+          set -eu
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
           git init
-          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
-          git config --global --add safe.directory '*'
-          git -c http.extraheader="AUTHORIZATION: bearer ${GH_TOKEN}" \
-            fetch --no-tags --prune --depth 1 origin "${GITHUB_SHA}" \
-            || git -c http.extraheader="AUTHORIZATION: bearer ${GH_TOKEN}" \
-              fetch --no-tags --prune --depth 1 origin "${GITHUB_REF}"
+          host="${GITHUB_SERVER_URL#https://}"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@${host}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --prune --depth 1 origin "${GITHUB_SHA}" \
+            || git fetch --no-tags --prune origin "${GITHUB_SHA}" \
+            || git fetch --no-tags --prune --depth 1 origin "${GITHUB_REF}"
           git checkout --force FETCH_HEAD
+          git remote set-url origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
           git log -1 --oneline
+          git rev-parse HEAD
       - name: Install Rust 1.97.1
         run: |
           CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
