@@ -34,6 +34,9 @@ jobs:
         target: [vault, identity_audit, policy_profile, dotenv]
     steps:
       - name: Checkout
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GIT_TERMINAL_PROMPT: "0"
         run: |
           set -eu
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"

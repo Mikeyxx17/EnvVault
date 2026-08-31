@@ -31,6 +31,9 @@ jobs:
           echo "repo=${GITHUB_REPOSITORY}"
           git --version
       - name: Checkout
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GIT_TERMINAL_PROMPT: "0"
         run: |
           set -eu
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
@@ -77,6 +80,9 @@ jobs:
           echo "repo=${GITHUB_REPOSITORY}"
           git --version
       - name: Checkout
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GIT_TERMINAL_PROMPT: "0"
         run: |
           set -eu
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
