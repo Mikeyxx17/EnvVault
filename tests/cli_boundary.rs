@@ -170,7 +170,7 @@ fn run_help_requires_files_and_exact_child_argv_without_secret_values()
     assert!(help.contains("--profile"));
     assert!(help.contains("--credential-file"));
     assert!(help.contains("--machine-unlock"));
-    assert!(help.contains("<COMMAND>..."));
+    assert!(help.contains("[COMMAND]..."));
     assert!(!help.contains("--value"));
     assert!(!help.contains("--password"));
     Ok(())
